@@ -41,25 +41,27 @@ VERSION=v2.0.0
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
 BASE="https://github.com/partofaplan/kad/releases/download/${VERSION}"
+ARCHIVE="kad_${VERSION}_${OS}_${ARCH}.tar.gz"
 
-curl -fsSLO "${BASE}/kad_${VERSION}_${OS}_${ARCH}.tar.gz"
+curl -fsSLO "${BASE}/${ARCHIVE}"
 curl -fsSLO "${BASE}/checksums.txt"
-shasum -a 256 -c checksums.txt --ignore-missing || sha256sum -c checksums.txt --ignore-missing
 ```
 
-**Stop here if that did not print `OK`.** A `FAILED` line means the download is
-not the file that was published, and the next step would install it and run it.
-macOS has `shasum` and most Linux distributions have `sha256sum`; running both
-covers either, so one `command not found` alongside an `OK` is expected and
-fine.
-
-With a good checksum, install it:
+Then verify it and install it. That is deliberately one long line rather than
+five readable ones. Chaining with `&&` means the install cannot run unless the
+checksum matched, so a file that is not what was published never reaches your
+PATH — and keeping it on one line means a half-finished paste cannot skip the
+check either, which a multi-line version would allow.
 
 ```bash
-tar -xzf "kad_${VERSION}_${OS}_${ARCH}.tar.gz"
-sudo install "kad_${OS}_${ARCH}/kad" /usr/local/bin/kad
-kad version
+{ shasum -a 256 -c checksums.txt --ignore-missing || sha256sum -c checksums.txt --ignore-missing; } && tar -xzf "${ARCHIVE}" && sudo install "kad_${OS}_${ARCH}/kad" /usr/local/bin/kad && kad version
 ```
+
+macOS has shasum and most Linux distributions have sha256sum, so seeing one of
+them report "command not found" is normal — what matters is that a line ends in
+OK. If you see FAILED, nothing was installed, and you should not run the
+archive you downloaded. Note that a FAILED run prints a "command not found" too,
+so that message alone tells you nothing either way.
 
 That last line should print the version. If it does, you are done.
 
@@ -93,17 +95,18 @@ $arch    = if ($env:PROCESSOR_ARCHITEW6432 -eq 'ARM64' -or $env:PROCESSOR_ARCHIT
 Invoke-WebRequest "https://github.com/partofaplan/kad/releases/download/$version/kad_${version}_windows_$arch.zip" -OutFile kad.zip
 Invoke-WebRequest "https://github.com/partofaplan/kad/releases/download/$version/checksums.txt" -OutFile checksums.txt
 
-(Get-FileHash kad.zip -Algorithm SHA256).Hash.ToLower()
-Select-String "kad_${version}_windows_$arch.zip" checksums.txt
+$published = ((Select-String "kad_${version}_windows_$arch.zip" checksums.txt).Line -split '\s+')[0]
+$actual    = (Get-FileHash kad.zip -Algorithm SHA256).Hash.ToLower()
+if ($actual -ne $published) { throw "checksum mismatch: $actual is not $published" }
 
 Expand-Archive kad.zip -DestinationPath $env:LOCALAPPDATA\kad -Force
 $env:PATH += ";$env:LOCALAPPDATA\kad\kad_windows_$arch"
 kad version
 ```
 
-Those two middle lines print the hash you downloaded and the hash that was
-published; they must match before you run anything. That `$env:PATH` line lasts
-for the current session only. To keep it, add the
+That `throw` stops the block before anything is unpacked if the download does
+not match what was published. The `$env:PATH` line lasts for the current
+session only. To keep it, add the
 same directory through **System Properties → Environment Variables**.
 
 **From source**, on any platform with Go 1.25 or later:
