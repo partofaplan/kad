@@ -1,0 +1,19 @@
+apiVersion: kad.aviture.dev/v1alpha1
+kind: Environment
+name: demo
+cluster:
+  driver: docker
+  kubernetes: v1.31.0
+  cpus: 4
+  memory: 8Gi
+  disk: 40Gi
+tools:
+  - harbor
+  - observability
+  - postgres
+apps:
+  - name: web
+    chart: nginx
+    repo: https://charts.bitnami.com/bitnami
+    version: 18.3.6
+    namespace: default

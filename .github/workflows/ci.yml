@@ -1,0 +1,137 @@
+name: CI
+
+on:
+  # Only the branches that publish. Feature branches are covered by the
+  # pull_request trigger, which tests the merge result rather than the branch
+  # tip; listing them here too would run everything twice per commit.
+  push:
+    branches: [ develop, main ]
+  pull_request:
+    branches: [ develop, main ]
+
+# Never cancel a develop/main run: those assign a version and mint a tag, and a
+# half-finished tagging run is worse than a slow queue. Pull request runs are
+# cancellable.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ !contains(fromJSON('["develop","main"]'), github.ref_name) }}
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - run: go vet ./...
+
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "::error::these files need gofmt:"; echo "$out"; exit 1
+          fi
+
+      # The shell scripts are not decoration: next-version.sh decides what gets
+      # tagged, and a tag cannot be moved once published.
+      - name: shellcheck
+        run: shellcheck hack/*.sh scripts/*.sh
+
+      - name: go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum \
+            || { echo "::error::go mod tidy left a diff; commit it"; exit 1; }
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest, windows-latest ]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      # Every platform kad ships a binary for runs the suite. The whole point of
+      # routing shell-outs through an injectable Runner is that this needs no
+      # cluster, no helm and no network — so there is no reason not to prove the
+      # tool works on all three.
+      #
+      # -race only on Linux: it needs cgo and a C toolchain, and the data it
+      # would find is platform-independent anyway.
+      - name: Test
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            go test -race -cover ./...
+          else
+            go test -cover ./...
+          fi
+
+  version-arithmetic:
+    name: Version arithmetic
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Its own suite, because it is the one piece of logic whose mistakes are
+      # irreversible: a wrong answer mints an immutable tag.
+      - run: ./hack/next-version_test.sh
+
+  build:
+    name: Cross-compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      # Proves every release target still builds, on every PR, rather than
+      # discovering a broken platform at release time.
+      - run: make dist
+      - run: cat dist/checksums.txt
+
+  version:
+    name: Tag the version
+    needs: [ lint, test, version-arithmetic, build ]
+    # Only on a merge, never on a pull request: a PR must not mint a tag.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0   # tags are the source of truth; we need all of them
+
+      # develop moves MINOR, main moves MAJOR. RELEASE moves only when someone
+      # cuts a release, which is release.yml and a deliberate act.
+      - name: Compute
+        id: v
+        run: |
+          case "${{ github.ref_name }}" in
+            develop) kind=minor ;;
+            main)    kind=major ;;
+            *) echo "::error::unexpected branch ${{ github.ref_name }}"; exit 1 ;;
+          esac
+          next=$(./hack/next-version.sh "$kind")
+          echo "version=${next}" >> "$GITHUB_OUTPUT"
+          echo "tagging v${next} (${kind} bump on ${{ github.ref_name }})"
+
+      - name: Tag
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "v${VERSION}" -m "v${VERSION}"
+          git push origin "v${VERSION}"
