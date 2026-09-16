@@ -8,8 +8,9 @@ import (
 )
 
 // Fake is a Runner for tests. Responses are matched against the full command
-// line by substring, first match wins; unmatched commands succeed silently so
-// a test only has to describe the calls it cares about.
+// line by substring, LONGEST match wins, so a specific pattern beats a general
+// one regardless of map order; unmatched commands succeed silently so a test
+// only has to describe the calls it cares about.
 type Fake struct {
 	// Responses maps a command-line substring to a canned result.
 	Responses map[string]Result

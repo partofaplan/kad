@@ -131,14 +131,21 @@ func starterSizing(ctx context.Context, env *Env) (cpus, memMi int, note string)
 		cpus = fallbackCPUs
 	}
 
-	// Below kad's own minimum there is no value that both fits the machine and
-	// parses, so the floor wins and the comment says so. Claiming "75% of
-	// 2048Mi" next to 4096Mi would be plainly false, and this is the one place
-	// a reader looks to understand where the number came from.
-	if memMi < config.MinMemoryMi {
+	// The note has to describe the number actually written, and the two ways
+	// the floor engages are not the same situation.
+	//
+	// Gate on the POOL, not on three quarters of it: a 5000Mi pool yields 3750
+	// before clamping, but 5000Mi is perfectly usable — kad runs at 4096Mi. An
+	// earlier version tested the clamped value and so told those users their
+	// machine "is not enough", talking them out of something that works.
+	switch {
+	case b.MemMi < config.MinMemoryMi:
 		return cpus, config.MinMemoryMi, fmt.Sprintf(
 			"kad's minimum — %s has only %dMi, which is not enough; raise it before running 'kad up'",
 			b.Source, b.MemMi)
+	case memMi < config.MinMemoryMi:
+		return cpus, config.MinMemoryMi, fmt.Sprintf(
+			"kad's minimum, which is most of the %dMi %s has", b.MemMi, b.Source)
 	}
 
 	return cpus, memMi, fmt.Sprintf("75%% of the %dMi %s has", b.MemMi, b.Source)
