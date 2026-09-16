@@ -256,18 +256,29 @@ func memoryCheck(name string, cfg *config.Config, b Budget) Check {
 
 	// Reserve a quarter for everything else that has to run there; a cluster
 	// that swaps is worse than one that refuses to start.
-	headroom := b.MemMi * 3 / 4
+	suggest := suggestMemoryMi(b.MemMi)
+
+	// No value satisfies both the pool and kad's minimum. Say that, rather than
+	// suggesting a number and rejecting it a moment later.
+	if suggest == 0 {
+		c.Status = Fail
+		c.Detail = fmt.Sprintf("%s has %dMi, and kad needs at least %dMi",
+			b.Source, b.MemMi, config.MinMemoryMi)
+		c.Fix = b.Fix
+		return c
+	}
+
 	switch {
 	case wantMi > b.MemMi:
 		c.Status = Fail
 		c.Detail = fmt.Sprintf("cluster.memory is %s (%dMi) but %s has only %dMi",
 			cfg.Cluster.Memory, wantMi, b.Source, b.MemMi)
-		c.Fix = fmt.Sprintf("set cluster.memory to about %dMi — %s", headroom, b.Fix)
-	case wantMi > headroom:
+		c.Fix = fmt.Sprintf("set cluster.memory to about %dMi — %s", suggest, b.Fix)
+	case wantMi > b.MemMi*3/4:
 		c.Status = Warn
 		c.Detail = fmt.Sprintf("cluster.memory (%s) is over 75%% of the %dMi %s has",
 			cfg.Cluster.Memory, b.MemMi, b.Source)
-		c.Fix = fmt.Sprintf("consider %dMi to leave room for everything else", headroom)
+		c.Fix = fmt.Sprintf("consider %dMi to leave room for everything else", suggest)
 	default:
 		c.Status = OK
 		c.Detail = fmt.Sprintf("%s of %dMi available to %s", cfg.Cluster.Memory, b.MemMi, b.Source)
@@ -350,43 +361,56 @@ func ResourceBudget(ctx context.Context, r runner.Runner, driver string) (Budget
 }
 
 func dockerBudget(ctx context.Context, r runner.Runner) (Budget, error) {
-	memRes, err := r.Run(ctx, "docker", "info", "--format", "{{.MemTotal}}")
+	res, err := r.Run(ctx, "docker", "info", "--format", "{{.MemTotal}} {{.NCPU}}")
 	if err != nil {
 		return Budget{}, err
 	}
-	bytes, err := strconv.ParseInt(strings.TrimSpace(memRes.Stdout), 10, 64)
-	if err != nil {
-		return Budget{}, fmt.Errorf("docker reported an unreadable memory total: %q", memRes.Stdout)
-	}
-	cpuRes, err := r.Run(ctx, "docker", "info", "--format", "{{.NCPU}}")
+	return parseBudget("docker", res.Stdout)
+}
+
+func podmanBudget(ctx context.Context, r runner.Runner) (Budget, error) {
+	res, err := r.Run(ctx, "podman", "info", "--format", "{{.Host.MemTotal}} {{.Host.CPUs}}")
 	if err != nil {
 		return Budget{}, err
 	}
-	cpus, err := strconv.Atoi(strings.TrimSpace(cpuRes.Stdout))
+	return parseBudget("podman", res.Stdout)
+}
+
+// parseBudget reads "<bytes> <cpus>" from one `info --format` call.
+//
+// One call rather than one per field: podman in particular prints a preamble on
+// stdout in some states, and two calls means two chances to trip over it.
+func parseBudget(tool, out string) (Budget, error) {
+	fields := strings.Fields(strings.TrimSpace(out))
+	if len(fields) != 2 {
+		return Budget{}, fmt.Errorf("%s reported an unreadable budget: %q", tool, out)
+	}
+	bytes, err := strconv.ParseInt(fields[0], 10, 64)
 	if err != nil {
-		return Budget{}, fmt.Errorf("docker reported an unreadable cpu count: %q", cpuRes.Stdout)
+		return Budget{}, fmt.Errorf("%s reported an unreadable memory total: %q", tool, fields[0])
+	}
+	cpus, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return Budget{}, fmt.Errorf("%s reported an unreadable cpu count: %q", tool, fields[1])
 	}
 	return Budget{CPUs: cpus, MemMi: int(bytes / 1024 / 1024)}, nil
 }
 
-func podmanBudget(ctx context.Context, r runner.Runner) (Budget, error) {
-	memRes, err := r.Run(ctx, "podman", "info", "--format", "{{.Host.MemTotal}}")
-	if err != nil {
-		return Budget{}, err
+// suggestMemoryMi is the largest value that both leaves headroom in the pool and
+// clears kad's own minimum.
+//
+// It returns 0 when the pool cannot satisfy the minimum at all, so callers say
+// that plainly instead of printing a number config.Validate would reject —
+// advice kad refuses is the same failure as a guardrail that passes a config
+// minikube refuses, which is the bug this whole check exists to fix.
+func suggestMemoryMi(poolMi int) int {
+	if poolMi < config.MinMemoryMi {
+		return 0
 	}
-	bytes, err := strconv.ParseInt(strings.TrimSpace(memRes.Stdout), 10, 64)
-	if err != nil {
-		return Budget{}, fmt.Errorf("podman reported an unreadable memory total: %q", memRes.Stdout)
+	if headroom := poolMi * 3 / 4; headroom >= config.MinMemoryMi {
+		return headroom
 	}
-	cpuRes, err := r.Run(ctx, "podman", "info", "--format", "{{.Host.CPUs}}")
-	if err != nil {
-		return Budget{}, err
-	}
-	cpus, err := strconv.Atoi(strings.TrimSpace(cpuRes.Stdout))
-	if err != nil {
-		return Budget{}, fmt.Errorf("podman reported an unreadable cpu count: %q", cpuRes.Stdout)
-	}
-	return Budget{CPUs: cpus, MemMi: int(bytes / 1024 / 1024)}, nil
+	return config.MinMemoryMi
 }
 
 func hostBudget(ctx context.Context, r runner.Runner) (Budget, error) {

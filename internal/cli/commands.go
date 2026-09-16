@@ -107,8 +107,8 @@ func runInit(ctx context.Context, env *Env, args []string) error {
 // comment explaining where the number came from.
 func starterSizing(ctx context.Context, env *Env) (cpus, memMi int, note string) {
 	const (
-		fallbackCPUs  = 2
-		fallbackMemMi = 4096
+		fallbackCPUs  = config.MinCPUs
+		fallbackMemMi = config.MinMemoryMi
 	)
 
 	b, err := doctor.ResourceBudget(ctx, env.Runner, config.Defaults.Driver)
@@ -122,9 +122,6 @@ func starterSizing(ctx context.Context, env *Env) (cpus, memMi int, note string)
 	if memMi > 8192 {
 		memMi = 8192
 	}
-	if memMi < fallbackMemMi {
-		memMi = fallbackMemMi
-	}
 
 	cpus = b.CPUs - 1
 	if cpus > 4 {
@@ -132,6 +129,16 @@ func starterSizing(ctx context.Context, env *Env) (cpus, memMi int, note string)
 	}
 	if cpus < fallbackCPUs {
 		cpus = fallbackCPUs
+	}
+
+	// Below kad's own minimum there is no value that both fits the machine and
+	// parses, so the floor wins and the comment says so. Claiming "75% of
+	// 2048Mi" next to 4096Mi would be plainly false, and this is the one place
+	// a reader looks to understand where the number came from.
+	if memMi < config.MinMemoryMi {
+		return cpus, config.MinMemoryMi, fmt.Sprintf(
+			"kad's minimum — %s has only %dMi, which is not enough; raise it before running 'kad up'",
+			b.Source, b.MemMi)
 	}
 
 	return cpus, memMi, fmt.Sprintf("75%% of the %dMi %s has", b.MemMi, b.Source)

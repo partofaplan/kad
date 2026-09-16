@@ -88,10 +88,14 @@ var Defaults = Cluster{
 // exercised against produces failures that look like kad bugs.
 var SupportedDrivers = []string{"docker", "podman", "qemu2", "vfkit", "hyperkit"}
 
-// minimums below which hydration reliably fails rather than merely running slow.
+// Minimums below which hydration reliably fails rather than merely running slow.
+//
+// Exported because doctor must never suggest a value this package would then
+// reject — advice kad refuses is the same failure as a guardrail that passes a
+// config minikube refuses.
 const (
-	minCPUs     = 2
-	minMemoryMi = 4096
+	MinCPUs     = 2
+	MinMemoryMi = 4096
 	minDiskMi   = 20480
 )
 
@@ -180,13 +184,13 @@ func (c *Config) Validate() error {
 	if !strings.HasPrefix(c.Cluster.Kubernetes, "v") {
 		add("cluster.kubernetes %q: must be a pinned version like v1.31.0", c.Cluster.Kubernetes)
 	}
-	if c.Cluster.CPUs < minCPUs {
-		add("cluster.cpus %d: need at least %d", c.Cluster.CPUs, minCPUs)
+	if c.Cluster.CPUs < MinCPUs {
+		add("cluster.cpus %d: need at least %d", c.Cluster.CPUs, MinCPUs)
 	}
 	if mi, err := ParseQuantityMi(c.Cluster.Memory); err != nil {
 		add("cluster.memory %q: %v", c.Cluster.Memory, err)
-	} else if mi < minMemoryMi {
-		add("cluster.memory %q: need at least %dMi to hydrate anything", c.Cluster.Memory, minMemoryMi)
+	} else if mi < MinMemoryMi {
+		add("cluster.memory %q: need at least %dMi to hydrate anything", c.Cluster.Memory, MinMemoryMi)
 	}
 	if mi, err := ParseQuantityMi(c.Cluster.Disk); err != nil {
 		add("cluster.disk %q: %v", c.Cluster.Disk, err)

@@ -19,25 +19,29 @@ func cfg(t *testing.T, extra string) *config.Config {
 	return c
 }
 
-// setCPUs answers the host-CPU probe for every platform at once, so these
-// tests assert the same thing whichever runner they land on in CI.
-func setCPUs(f *runner.Fake, n int) {
-	f.Responses["sysctl -n hw.ncpu"] = runner.Result{Stdout: fmt.Sprintf("%d\n", n)}
-	f.Responses["nproc"] = runner.Result{Stdout: fmt.Sprintf("%d\n", n)}
-	f.Responses["NumberOfLogicalProcessors"] = runner.Result{Stdout: fmt.Sprintf("%d\n", n)}
-	f.Responses["{{.NCPU}}"] = runner.Result{Stdout: fmt.Sprintf("%d\n", n)}
-	f.Responses["{{.Host.CPUs}}"] = runner.Result{Stdout: fmt.Sprintf("%d\n", n)}
+// setBudget answers every platform's resource probe at once — the host ones and
+// the single `docker/podman info --format` call — so a test states the machine
+// it means once and asserts the same thing on whichever runner CI gives it.
+func setBudget(f *runner.Fake, cpus, memGi int) {
+	memBytes := int64(memGi) * 1024 * 1024 * 1024
+
+	f.Responses["sysctl -n hw.ncpu"] = runner.Result{Stdout: fmt.Sprintf("%d\n", cpus)}
+	f.Responses["nproc"] = runner.Result{Stdout: fmt.Sprintf("%d\n", cpus)}
+	f.Responses["NumberOfLogicalProcessors"] = runner.Result{Stdout: fmt.Sprintf("%d\n", cpus)}
+
+	f.Responses["sysctl -n hw.memsize"] = runner.Result{Stdout: fmt.Sprintf("%d\n", memBytes)}
+	f.Responses["grep MemTotal"] = runner.Result{Stdout: fmt.Sprintf("%d\n", int64(memGi)*1024*1024)}
+	f.Responses["TotalPhysicalMemory"] = runner.Result{Stdout: fmt.Sprintf("%d\n", memBytes)}
+
+	// Both fields come from one call now, so the fake answers with both.
+	f.Responses["docker info --format"] = runner.Result{Stdout: fmt.Sprintf("%d %d\n", memBytes, cpus)}
+	f.Responses["podman info --format"] = runner.Result{Stdout: fmt.Sprintf("%d %d\n", memBytes, cpus)}
 }
 
-// setMemoryGi answers the host-memory probe for every platform at once. Each
-// platform reports a different unit, which is exactly the sort of thing one
-// helper should get right once.
-func setMemoryGi(f *runner.Fake, gi int) {
-	f.Responses["sysctl -n hw.memsize"] = runner.Result{Stdout: fmt.Sprintf("%d\n", gi*1024*1024*1024)}
-	f.Responses["grep MemTotal"] = runner.Result{Stdout: fmt.Sprintf("%d\n", gi*1024*1024)}
-	f.Responses["TotalPhysicalMemory"] = runner.Result{Stdout: fmt.Sprintf("%d\n", gi*1024*1024*1024)}
-	f.Responses["{{.MemTotal}}"] = runner.Result{Stdout: fmt.Sprintf("%d\n", gi*1024*1024*1024)}
-	f.Responses["{{.Host.MemTotal}}"] = runner.Result{Stdout: fmt.Sprintf("%d\n", gi*1024*1024*1024)}
+// setDockerBudget overrides only what Docker reports, leaving the host large —
+// the shape of the bug these checks exist for.
+func setDockerBudget(f *runner.Fake, cpus int, memBytes int64) {
+	f.Responses["docker info --format"] = runner.Result{Stdout: fmt.Sprintf("%d %d\n", memBytes, cpus)}
 }
 
 // A healthy host, as the fake sees it.
@@ -47,8 +51,7 @@ func healthy() *runner.Fake {
 	f.Responses["kubectl version"] = runner.Result{Stdout: "Client Version: v1.31.0"}
 	f.Responses["helm version"] = runner.Result{Stdout: "v3.16.2+g9a1b2c3"}
 	f.Responses["profile list"] = runner.Result{Stdout: `{"valid":[]}`}
-	setCPUs(f, 10)
-	setMemoryGi(f, 32)
+	setBudget(f, 10, 32)
 	return f
 }
 
@@ -150,7 +153,7 @@ func TestSingleRuntimeDoesNotWarn(t *testing.T) {
 
 func TestOvercommittedMemoryFails(t *testing.T) {
 	f := healthy()
-	setMemoryGi(f, 8)
+	setBudget(f, 10, 8)
 
 	c := find(t, Run(context.Background(), f, cfg(t, "cluster:\n  memory: 16Gi\n")), "budget/docker/memory")
 	if c.Status != Fail {
@@ -163,7 +166,7 @@ func TestOvercommittedMemoryFails(t *testing.T) {
 
 func TestMemoryOverThreeQuartersWarns(t *testing.T) {
 	f := healthy()
-	setMemoryGi(f, 16)
+	setBudget(f, 10, 16)
 
 	c := find(t, Run(context.Background(), f, cfg(t, "cluster:\n  memory: 14Gi\n")), "budget/docker/memory")
 	if c.Status != Warn {
@@ -173,7 +176,7 @@ func TestMemoryOverThreeQuartersWarns(t *testing.T) {
 
 func TestClaimingEveryCoreWarns(t *testing.T) {
 	f := healthy()
-	setCPUs(f, 4)
+	setBudget(f, 4, 32)
 
 	c := find(t, Run(context.Background(), f, cfg(t, "cluster:\n  cpus: 4\n")), "budget/docker/cpu")
 	if c.Status != Warn {
@@ -183,7 +186,7 @@ func TestClaimingEveryCoreWarns(t *testing.T) {
 
 func TestMoreCoresThanTheHostHasFails(t *testing.T) {
 	f := healthy()
-	setCPUs(f, 2)
+	setBudget(f, 2, 32)
 
 	c := find(t, Run(context.Background(), f, cfg(t, "cluster:\n  cpus: 8\n")), "budget/docker/cpu")
 	if c.Status != Fail {
@@ -263,7 +266,7 @@ func TestVersionOrdering(t *testing.T) {
 func TestEveryFailureNamesAFix(t *testing.T) {
 	f := healthy()
 	f.Missing = []string{"minikube", "kubectl", "helm", "docker"}
-	setCPUs(f, 1)
+	setBudget(f, 1, 32)
 
 	rep := Run(context.Background(), f, cfg(t, ""))
 	if len(rep.Failures()) == 0 {
@@ -282,10 +285,8 @@ func TestEveryFailureNamesAFix(t *testing.T) {
 // on a machine where Docker Desktop had 7834Mi and minikube then refused.
 func TestDockerDriverIsBudgetedByDockerNotTheHost(t *testing.T) {
 	f := healthy()
-	setMemoryGi(f, 64) // a big host...
-	f.Responses["docker info --format {{.MemTotal}}"] = runner.Result{
-		Stdout: "8214585344\n", // ...with only 7834Mi given to Docker
-	}
+	setBudget(f, 12, 64)               // a big host...
+	setDockerBudget(f, 12, 8214585344) // ...with only 7834Mi given to Docker
 
 	rep := Run(context.Background(), f, cfg(t, "cluster:\n  memory: 8Gi\n"))
 	c := find(t, rep, "budget/docker/memory")
@@ -307,8 +308,8 @@ func TestDockerDriverIsBudgetedByDockerNotTheHost(t *testing.T) {
 // A VM driver really is bounded by the host, so that path must not regress.
 func TestVMDriverIsBudgetedByTheHost(t *testing.T) {
 	f := healthy()
-	setMemoryGi(f, 64)
-	f.Responses["docker info --format {{.MemTotal}}"] = runner.Result{Stdout: "8214585344\n"}
+	setBudget(f, 12, 64)
+	setDockerBudget(f, 12, 8214585344)
 
 	rep := Run(context.Background(), f, cfg(t, "cluster:\n  driver: qemu2\n  memory: 16Gi\n"))
 	c := find(t, rep, "budget/qemu2/memory")
@@ -330,5 +331,45 @@ func TestUnknownBudgetWarnsRatherThanBlocks(t *testing.T) {
 	}
 	if rep.OK() == false {
 		t.Error("an unknown budget blocked the build")
+	}
+}
+
+// doctor must never advise a value config.Validate would reject. That is the
+// same failure as the bug this check exists for — kad refusing its own advice —
+// and it became routinely reachable once the pool was Docker's rather than the
+// host's, because a host is almost always over the minimum and Docker often is not.
+func TestSuggestedMemoryIsAlwaysAcceptedByConfig(t *testing.T) {
+	for poolMi := 1024; poolMi <= 65536; poolMi += 257 {
+		got := suggestMemoryMi(poolMi)
+		if got == 0 {
+			if poolMi >= config.MinMemoryMi {
+				t.Errorf("pool %dMi: refused to suggest anything despite clearing the minimum", poolMi)
+			}
+			continue
+		}
+		if got < config.MinMemoryMi {
+			t.Errorf("pool %dMi: suggested %dMi, below kad's own minimum of %dMi",
+				poolMi, got, config.MinMemoryMi)
+		}
+		if got > poolMi {
+			t.Errorf("pool %dMi: suggested %dMi, more than the pool holds", poolMi, got)
+		}
+	}
+}
+
+// When nothing valid fits, say that rather than naming a number.
+func TestTooSmallAPoolSaysSoInsteadOfSuggestingAnImpossibleValue(t *testing.T) {
+	f := healthy()
+	setDockerBudget(f, 4, 2147483648) // 2Gi
+
+	c := find(t, Run(context.Background(), f, cfg(t, "")), "budget/docker/memory")
+	if c.Status != Fail {
+		t.Fatalf("status = %v, want fail on a 2Gi pool", c.Status)
+	}
+	if !strings.Contains(c.Detail, "at least") {
+		t.Errorf("detail does not state kad's minimum: %q", c.Detail)
+	}
+	if strings.Contains(c.Fix, "1536") {
+		t.Errorf("fix suggested a value below kad's minimum: %q", c.Fix)
 	}
 }
