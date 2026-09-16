@@ -24,9 +24,15 @@ release](https://github.com/partofaplan/kad/releases/latest), check it against
 
 Copy the lines **inside** the box, not the ``` fences around it.
 
+<!-- Maintainers: no `#` comments inside this block, ever. macOS zsh does not
+     set interactive_comments, so a pasted `VAR=value  # note` line runs `#` as
+     a command and the assignment is scoped to it — the variable comes out
+     EMPTY, and the reader gets a 404 on a URL with a hole in it. Explain things
+     in the prose around the block instead. -->
+
 ```bash
-VERSION=v2.0.0   # check the releases page above for anything newer
-OS=$(uname -s | tr '[:upper:]' '[:lower:]')          # darwin | linux
+VERSION=v2.0.0
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
 
 curl -fsSLO "https://github.com/partofaplan/kad/releases/download/${VERSION}/kad_${VERSION}_${OS}_${ARCH}.tar.gz"
@@ -37,11 +43,26 @@ kad version
 
 That last line should print the version. If it does, you are done.
 
-`VERSION` is written out rather than looked up through the GitHub API on
-purpose. The API allows 60 unauthenticated requests per hour per IP, and when
-you exceed it the lookup returns nothing — which used to produce a `curl: (56)
-... 404` against a URL with an empty version in it, and then a `tar` error about
-a file that was never downloaded. Neither message mentions the actual cause.
+`VERSION` is the release to install — check the [releases
+page](https://github.com/partofaplan/kad/releases) for anything newer. `OS` and
+`ARCH` detect themselves, and resolve to `darwin` or `linux`, and `amd64` or
+`arm64`.
+
+It is written out rather than looked up through the GitHub API on purpose. The
+API allows 60 unauthenticated requests per hour per IP, and over that limit the
+lookup returns nothing — which produced a `curl: (56) ... 404` against a URL
+with an empty version in it, then a `tar` error about a file that was never
+downloaded. Neither message mentions the actual cause.
+
+### Verify the download
+
+```bash
+curl -fsSLO "https://github.com/partofaplan/kad/releases/download/${VERSION}/checksums.txt"
+shasum -a 256 -c checksums.txt --ignore-missing || sha256sum -c checksums.txt --ignore-missing
+```
+
+macOS has `shasum` and most Linux distributions have `sha256sum`; running both
+covers either. You want `OK` for the archive you downloaded.
 
 **If macOS refuses to run the binary**, clear the quarantine flag:
 
@@ -58,7 +79,7 @@ Gatekeeper was never your problem.
 
 ```powershell
 $version = 'v2.0.0'   # check the releases page above for anything newer
-$arch    = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'amd64' }
+$arch    = if ($env:PROCESSOR_ARCHITEW6432 -eq 'ARM64' -or $env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'amd64' }
 
 Invoke-WebRequest "https://github.com/partofaplan/kad/releases/download/$version/kad_${version}_windows_$arch.zip" -OutFile kad.zip
 Expand-Archive kad.zip -DestinationPath $env:LOCALAPPDATA\kad -Force
