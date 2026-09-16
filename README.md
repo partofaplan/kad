@@ -22,29 +22,52 @@ release](https://github.com/partofaplan/kad/releases/latest), check it against
 
 **macOS and Linux**
 
+Copy the lines **inside** the box, not the ``` fences around it.
+
 ```bash
+VERSION=v1.0.0   # check the releases page above for anything newer
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')          # darwin | linux
 ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
-VERSION=$(curl -fsSL https://api.github.com/repos/partofaplan/kad/releases/latest | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')
 
 curl -fsSLO "https://github.com/partofaplan/kad/releases/download/${VERSION}/kad_${VERSION}_${OS}_${ARCH}.tar.gz"
 tar -xzf "kad_${VERSION}_${OS}_${ARCH}.tar.gz"
 sudo install "kad_${OS}_${ARCH}/kad" /usr/local/bin/kad
+kad version
 ```
 
-On macOS, Gatekeeper quarantines downloaded binaries. If it refuses to run:
-`xattr -d com.apple.quarantine /usr/local/bin/kad`.
+That last line should print the version. If it does, you are done.
+
+`VERSION` is written out rather than looked up through the GitHub API on
+purpose. The API allows 60 unauthenticated requests per hour per IP, and when
+you exceed it the lookup returns nothing — which used to produce a `curl: (56)
+... 404` against a URL with an empty version in it, and then a `tar` error about
+a file that was never downloaded. Neither message mentions the actual cause.
+
+**If macOS refuses to run the binary**, clear the quarantine flag:
+
+```bash
+xattr -d com.apple.quarantine /usr/local/bin/kad
+```
+
+You will usually not need this. macOS quarantines files downloaded by a
+*browser*, not by `curl`, so if you followed the steps above the attribute is
+not there and the command reports `No such xattr` — which is harmless, and means
+Gatekeeper was never your problem.
 
 **Windows** (PowerShell)
 
 ```powershell
-$version = (Invoke-RestMethod https://api.github.com/repos/partofaplan/kad/releases/latest).tag_name
+$version = 'v1.0.0'   # check the releases page above for anything newer
 $arch    = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'amd64' }
 
 Invoke-WebRequest "https://github.com/partofaplan/kad/releases/download/$version/kad_${version}_windows_$arch.zip" -OutFile kad.zip
 Expand-Archive kad.zip -DestinationPath $env:LOCALAPPDATA\kad -Force
 $env:PATH += ";$env:LOCALAPPDATA\kad\kad_windows_$arch"
+kad version
 ```
+
+That `$env:PATH` line lasts for the current session only. To keep it, add the
+same directory through **System Properties → Environment Variables**.
 
 **From source**, on any platform with Go 1.25 or later:
 
