@@ -22,20 +22,40 @@ release](https://github.com/partofaplan/kad/releases/latest), check it against
 
 **macOS and Linux**
 
-Copy the lines **inside** the box, not the ``` fences around it.
+Copy the lines inside the box below, not the fence markers around it.
 
-<!-- Maintainers: no `#` comments inside this block, ever. macOS zsh does not
+<!-- Maintainers: no `#` comments inside these blocks, ever. macOS zsh does not
      set interactive_comments, so a pasted `VAR=value  # note` line runs `#` as
      a command and the assignment is scoped to it — the variable comes out
-     EMPTY, and the reader gets a 404 on a URL with a hole in it. Explain things
-     in the prose around the block instead. -->
+     EMPTY, and the reader gets a 404 on a URL with a hole in it. Explain
+     things in the prose instead.
+
+     In that prose, keep backticks BALANCED and never write a literal triple.
+     People bulk-paste whole sections, and an odd number opens a backquote that
+     swallows every line after it, leaving them at a bquote> prompt with
+     nothing downloaded. A balanced pair is survivable — zsh just reports the
+     contents as a command it cannot find. -->
 
 ```bash
 VERSION=v2.0.0
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+BASE="https://github.com/partofaplan/kad/releases/download/${VERSION}"
 
-curl -fsSLO "https://github.com/partofaplan/kad/releases/download/${VERSION}/kad_${VERSION}_${OS}_${ARCH}.tar.gz"
+curl -fsSLO "${BASE}/kad_${VERSION}_${OS}_${ARCH}.tar.gz"
+curl -fsSLO "${BASE}/checksums.txt"
+shasum -a 256 -c checksums.txt --ignore-missing || sha256sum -c checksums.txt --ignore-missing
+```
+
+**Stop here if that did not print `OK`.** A `FAILED` line means the download is
+not the file that was published, and the next step would install it and run it.
+macOS has `shasum` and most Linux distributions have `sha256sum`; running both
+covers either, so one `command not found` alongside an `OK` is expected and
+fine.
+
+With a good checksum, install it:
+
+```bash
 tar -xzf "kad_${VERSION}_${OS}_${ARCH}.tar.gz"
 sudo install "kad_${OS}_${ARCH}/kad" /usr/local/bin/kad
 kad version
@@ -45,24 +65,13 @@ That last line should print the version. If it does, you are done.
 
 `VERSION` is the release to install — check the [releases
 page](https://github.com/partofaplan/kad/releases) for anything newer. `OS` and
-`ARCH` detect themselves, and resolve to `darwin` or `linux`, and `amd64` or
-`arm64`.
+`ARCH` detect themselves, resolving to darwin or linux, and amd64 or arm64.
 
-It is written out rather than looked up through the GitHub API on purpose. The
-API allows 60 unauthenticated requests per hour per IP, and over that limit the
-lookup returns nothing — which produced a `curl: (56) ... 404` against a URL
-with an empty version in it, then a `tar` error about a file that was never
+The version is written out rather than looked up through the GitHub API on
+purpose. The API allows 60 unauthenticated requests per hour per IP, and over
+that limit the lookup returns nothing — which produced a curl 404 against a URL
+with an empty version in it, then a tar error about a file that was never
 downloaded. Neither message mentions the actual cause.
-
-### Verify the download
-
-```bash
-curl -fsSLO "https://github.com/partofaplan/kad/releases/download/${VERSION}/checksums.txt"
-shasum -a 256 -c checksums.txt --ignore-missing || sha256sum -c checksums.txt --ignore-missing
-```
-
-macOS has `shasum` and most Linux distributions have `sha256sum`; running both
-covers either. You want `OK` for the archive you downloaded.
 
 **If macOS refuses to run the binary**, clear the quarantine flag:
 
@@ -71,8 +80,8 @@ xattr -d com.apple.quarantine /usr/local/bin/kad
 ```
 
 You will usually not need this. macOS quarantines files downloaded by a
-*browser*, not by `curl`, so if you followed the steps above the attribute is
-not there and the command reports `No such xattr` — which is harmless, and means
+*browser*, not by curl, so if you followed the steps above the attribute is not
+there and the command reports "No such xattr" — which is harmless, and means
 Gatekeeper was never your problem.
 
 **Windows** (PowerShell)
@@ -82,12 +91,19 @@ $version = 'v2.0.0'   # check the releases page above for anything newer
 $arch    = if ($env:PROCESSOR_ARCHITEW6432 -eq 'ARM64' -or $env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'amd64' }
 
 Invoke-WebRequest "https://github.com/partofaplan/kad/releases/download/$version/kad_${version}_windows_$arch.zip" -OutFile kad.zip
+Invoke-WebRequest "https://github.com/partofaplan/kad/releases/download/$version/checksums.txt" -OutFile checksums.txt
+
+(Get-FileHash kad.zip -Algorithm SHA256).Hash.ToLower()
+Select-String "kad_${version}_windows_$arch.zip" checksums.txt
+
 Expand-Archive kad.zip -DestinationPath $env:LOCALAPPDATA\kad -Force
 $env:PATH += ";$env:LOCALAPPDATA\kad\kad_windows_$arch"
 kad version
 ```
 
-That `$env:PATH` line lasts for the current session only. To keep it, add the
+Those two middle lines print the hash you downloaded and the hash that was
+published; they must match before you run anything. That `$env:PATH` line lasts
+for the current session only. To keep it, add the
 same directory through **System Properties → Environment Variables**.
 
 **From source**, on any platform with Go 1.25 or later:
