@@ -90,8 +90,9 @@ func Run(ctx context.Context, r runner.Runner, cfg *config.Config) Report {
 	}
 	add(checkRuntime(ctx, r, cfg))
 	add(checkAmbiguousRuntime(r))
-	add(checkHostCPU(ctx, r, cfg))
-	add(checkHostMemory(ctx, r, cfg))
+	for _, c := range checkResources(ctx, r, cfg) {
+		add(c)
+	}
 	add(checkProfileCollision(ctx, r, cfg))
 
 	return rep
@@ -197,42 +198,54 @@ func checkAmbiguousRuntime(r runner.Runner) Check {
 	return c
 }
 
-func checkHostCPU(ctx context.Context, r runner.Runner, cfg *config.Config) Check {
-	c := Check{Name: "host/cpu"}
+// checkResources verifies the cluster fits in whatever pool it is carved from.
+//
+// One check rather than two, because CPU and memory come from the same place
+// and asking for it twice would run 'docker info' twice.
+func checkResources(ctx context.Context, r runner.Runner, cfg *config.Config) []Check {
+	name := "budget/" + cfg.Cluster.Driver
 
-	have, err := hostCPUs(ctx, r)
+	b, err := ResourceBudget(ctx, r, cfg.Cluster.Driver)
 	if err != nil {
-		c.Status = Warn
-		c.Detail = "could not determine host CPU count"
-		return c
+		// Unknown is a warning, not a failure: it means kad could not ask, not
+		// that the answer is bad. minikube will still refuse if it does not fit.
+		return []Check{{
+			Name:   name,
+			Status: Warn,
+			Detail: "could not determine how much cpu and memory the cluster can use",
+			Fix:    "kad cannot pre-check the size; 'kad up' will report it if the cluster does not fit",
+		}}
 	}
+
+	return []Check{
+		cpuCheck(name+"/cpu", cfg, b),
+		memoryCheck(name+"/memory", cfg, b),
+	}
+}
+
+func cpuCheck(name string, cfg *config.Config, b Budget) Check {
+	c := Check{Name: name}
 	want := cfg.Cluster.CPUs
 
 	switch {
-	case have < want:
+	case want > b.CPUs:
 		c.Status = Fail
-		c.Detail = fmt.Sprintf("cluster.cpus is %d but the host has %d", want, have)
-		c.Fix = fmt.Sprintf("lower cluster.cpus to %d or fewer in kad.yaml", max(have-1, 2))
-	case have == want:
+		c.Detail = fmt.Sprintf("cluster.cpus is %d but %s has %d", want, b.Source, b.CPUs)
+		c.Fix = fmt.Sprintf("set cluster.cpus to %d or fewer — %s", max(b.CPUs-1, 2), b.Fix)
+	case want == b.CPUs:
 		c.Status = Warn
-		c.Detail = fmt.Sprintf("cluster.cpus (%d) is every core on the host", want)
-		c.Fix = "leave at least one core for the host; the machine will be unusable during hydration"
+		c.Detail = fmt.Sprintf("cluster.cpus (%d) is every core %s has", want, b.Source)
+		c.Fix = "leave one spare; the machine will be unresponsive while the cluster builds"
 	default:
 		c.Status = OK
-		c.Detail = fmt.Sprintf("%d of %d cores requested", want, have)
+		c.Detail = fmt.Sprintf("%d of %d cores available to %s", want, b.CPUs, b.Source)
 	}
 	return c
 }
 
-func checkHostMemory(ctx context.Context, r runner.Runner, cfg *config.Config) Check {
-	c := Check{Name: "host/memory"}
+func memoryCheck(name string, cfg *config.Config, b Budget) Check {
+	c := Check{Name: name}
 
-	haveMi, err := hostMemoryMi(ctx, r)
-	if err != nil {
-		c.Status = Warn
-		c.Detail = "could not determine host memory"
-		return c
-	}
 	wantMi, err := config.ParseQuantityMi(cfg.Cluster.Memory)
 	if err != nil {
 		c.Status = Fail
@@ -241,22 +254,23 @@ func checkHostMemory(ctx context.Context, r runner.Runner, cfg *config.Config) C
 		return c
 	}
 
-	// Reserve a quarter of the host for the OS and everything else the
-	// developer is running; a cluster that swaps is worse than one that
-	// refuses to start.
-	budget := haveMi * 3 / 4
+	// Reserve a quarter for everything else that has to run there; a cluster
+	// that swaps is worse than one that refuses to start.
+	headroom := b.MemMi * 3 / 4
 	switch {
-	case wantMi > haveMi:
+	case wantMi > b.MemMi:
 		c.Status = Fail
-		c.Detail = fmt.Sprintf("cluster.memory is %s but the host has %dMi", cfg.Cluster.Memory, haveMi)
-		c.Fix = fmt.Sprintf("lower cluster.memory to about %dMi in kad.yaml", budget)
-	case wantMi > budget:
+		c.Detail = fmt.Sprintf("cluster.memory is %s (%dMi) but %s has only %dMi",
+			cfg.Cluster.Memory, wantMi, b.Source, b.MemMi)
+		c.Fix = fmt.Sprintf("set cluster.memory to about %dMi — %s", headroom, b.Fix)
+	case wantMi > headroom:
 		c.Status = Warn
-		c.Detail = fmt.Sprintf("cluster.memory (%s) is over 75%% of the host's %dMi", cfg.Cluster.Memory, haveMi)
-		c.Fix = fmt.Sprintf("consider %dMi to leave room for the host", budget)
+		c.Detail = fmt.Sprintf("cluster.memory (%s) is over 75%% of the %dMi %s has",
+			cfg.Cluster.Memory, b.MemMi, b.Source)
+		c.Fix = fmt.Sprintf("consider %dMi to leave room for everything else", headroom)
 	default:
 		c.Status = OK
-		c.Detail = fmt.Sprintf("%s of %dMi requested", cfg.Cluster.Memory, haveMi)
+		c.Detail = fmt.Sprintf("%s of %dMi available to %s", cfg.Cluster.Memory, b.MemMi, b.Source)
 	}
 	return c
 }
@@ -287,7 +301,105 @@ func checkProfileCollision(ctx context.Context, r runner.Runner, cfg *config.Con
 	return c
 }
 
-// --- host introspection ---
+// --- where the cluster's resources actually come from ---
+
+// Budget is the pool a cluster is carved out of, and what to call it when
+// telling the user it is too small.
+type Budget struct {
+	Source string // "Docker Desktop", "podman machine", "this host"
+	CPUs   int
+	MemMi  int
+	Fix    string // how to make the pool bigger, if that is possible
+}
+
+// ResourceBudget answers the only question that matters: how much can the
+// cluster actually get?
+//
+// For a VM driver that is the host. For the docker and podman drivers it is
+// emphatically NOT the host — minikube runs the node inside the runtime's VM,
+// so the ceiling is whatever that VM was given. Checking the host instead is
+// how 'kad doctor' came to report "8Gi of 36864Mi requested" and pass, on a
+// machine where Docker Desktop had 7834Mi and minikube refused to start.
+func ResourceBudget(ctx context.Context, r runner.Runner, driver string) (Budget, error) {
+	switch driver {
+	case "docker":
+		b, err := dockerBudget(ctx, r)
+		if err != nil {
+			return Budget{}, err
+		}
+		b.Source = "Docker Desktop"
+		b.Fix = "raise it in Docker Desktop → Settings → Resources, or lower the value in kad.yaml"
+		return b, nil
+	case "podman":
+		b, err := podmanBudget(ctx, r)
+		if err != nil {
+			return Budget{}, err
+		}
+		b.Source = "the podman machine"
+		b.Fix = "recreate the machine with more (podman machine set --memory/--cpus), or lower the value in kad.yaml"
+		return b, nil
+	default:
+		b, err := hostBudget(ctx, r)
+		if err != nil {
+			return Budget{}, err
+		}
+		b.Source = "this host"
+		b.Fix = "lower the value in kad.yaml"
+		return b, nil
+	}
+}
+
+func dockerBudget(ctx context.Context, r runner.Runner) (Budget, error) {
+	memRes, err := r.Run(ctx, "docker", "info", "--format", "{{.MemTotal}}")
+	if err != nil {
+		return Budget{}, err
+	}
+	bytes, err := strconv.ParseInt(strings.TrimSpace(memRes.Stdout), 10, 64)
+	if err != nil {
+		return Budget{}, fmt.Errorf("docker reported an unreadable memory total: %q", memRes.Stdout)
+	}
+	cpuRes, err := r.Run(ctx, "docker", "info", "--format", "{{.NCPU}}")
+	if err != nil {
+		return Budget{}, err
+	}
+	cpus, err := strconv.Atoi(strings.TrimSpace(cpuRes.Stdout))
+	if err != nil {
+		return Budget{}, fmt.Errorf("docker reported an unreadable cpu count: %q", cpuRes.Stdout)
+	}
+	return Budget{CPUs: cpus, MemMi: int(bytes / 1024 / 1024)}, nil
+}
+
+func podmanBudget(ctx context.Context, r runner.Runner) (Budget, error) {
+	memRes, err := r.Run(ctx, "podman", "info", "--format", "{{.Host.MemTotal}}")
+	if err != nil {
+		return Budget{}, err
+	}
+	bytes, err := strconv.ParseInt(strings.TrimSpace(memRes.Stdout), 10, 64)
+	if err != nil {
+		return Budget{}, fmt.Errorf("podman reported an unreadable memory total: %q", memRes.Stdout)
+	}
+	cpuRes, err := r.Run(ctx, "podman", "info", "--format", "{{.Host.CPUs}}")
+	if err != nil {
+		return Budget{}, err
+	}
+	cpus, err := strconv.Atoi(strings.TrimSpace(cpuRes.Stdout))
+	if err != nil {
+		return Budget{}, fmt.Errorf("podman reported an unreadable cpu count: %q", cpuRes.Stdout)
+	}
+	return Budget{CPUs: cpus, MemMi: int(bytes / 1024 / 1024)}, nil
+}
+
+func hostBudget(ctx context.Context, r runner.Runner) (Budget, error) {
+	cpus, err := hostCPUs(ctx, r)
+	if err != nil {
+		return Budget{}, err
+	}
+	memMi, err := hostMemoryMi(ctx, r)
+	if err != nil {
+		return Budget{}, err
+	}
+	return Budget{CPUs: cpus, MemMi: memMi}, nil
+}
 
 func hostCPUs(ctx context.Context, r runner.Runner) (int, error) {
 	switch runtime.GOOS {

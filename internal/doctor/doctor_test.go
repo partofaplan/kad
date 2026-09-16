@@ -25,6 +25,8 @@ func setCPUs(f *runner.Fake, n int) {
 	f.Responses["sysctl -n hw.ncpu"] = runner.Result{Stdout: fmt.Sprintf("%d\n", n)}
 	f.Responses["nproc"] = runner.Result{Stdout: fmt.Sprintf("%d\n", n)}
 	f.Responses["NumberOfLogicalProcessors"] = runner.Result{Stdout: fmt.Sprintf("%d\n", n)}
+	f.Responses["{{.NCPU}}"] = runner.Result{Stdout: fmt.Sprintf("%d\n", n)}
+	f.Responses["{{.Host.CPUs}}"] = runner.Result{Stdout: fmt.Sprintf("%d\n", n)}
 }
 
 // setMemoryGi answers the host-memory probe for every platform at once. Each
@@ -32,8 +34,10 @@ func setCPUs(f *runner.Fake, n int) {
 // helper should get right once.
 func setMemoryGi(f *runner.Fake, gi int) {
 	f.Responses["sysctl -n hw.memsize"] = runner.Result{Stdout: fmt.Sprintf("%d\n", gi*1024*1024*1024)}
-	f.Responses["MemTotal"] = runner.Result{Stdout: fmt.Sprintf("%d\n", gi*1024*1024)}
+	f.Responses["grep MemTotal"] = runner.Result{Stdout: fmt.Sprintf("%d\n", gi*1024*1024)}
 	f.Responses["TotalPhysicalMemory"] = runner.Result{Stdout: fmt.Sprintf("%d\n", gi*1024*1024*1024)}
+	f.Responses["{{.MemTotal}}"] = runner.Result{Stdout: fmt.Sprintf("%d\n", gi*1024*1024*1024)}
+	f.Responses["{{.Host.MemTotal}}"] = runner.Result{Stdout: fmt.Sprintf("%d\n", gi*1024*1024*1024)}
 }
 
 // A healthy host, as the fake sees it.
@@ -148,7 +152,7 @@ func TestOvercommittedMemoryFails(t *testing.T) {
 	f := healthy()
 	setMemoryGi(f, 8)
 
-	c := find(t, Run(context.Background(), f, cfg(t, "cluster:\n  memory: 16Gi\n")), "host/memory")
+	c := find(t, Run(context.Background(), f, cfg(t, "cluster:\n  memory: 16Gi\n")), "budget/docker/memory")
 	if c.Status != Fail {
 		t.Errorf("status = %v, want fail when asking for more memory than the host has", c.Status)
 	}
@@ -161,7 +165,7 @@ func TestMemoryOverThreeQuartersWarns(t *testing.T) {
 	f := healthy()
 	setMemoryGi(f, 16)
 
-	c := find(t, Run(context.Background(), f, cfg(t, "cluster:\n  memory: 14Gi\n")), "host/memory")
+	c := find(t, Run(context.Background(), f, cfg(t, "cluster:\n  memory: 14Gi\n")), "budget/docker/memory")
 	if c.Status != Warn {
 		t.Errorf("status = %v, want warn at 14 of 16Gi", c.Status)
 	}
@@ -171,7 +175,7 @@ func TestClaimingEveryCoreWarns(t *testing.T) {
 	f := healthy()
 	setCPUs(f, 4)
 
-	c := find(t, Run(context.Background(), f, cfg(t, "cluster:\n  cpus: 4\n")), "host/cpu")
+	c := find(t, Run(context.Background(), f, cfg(t, "cluster:\n  cpus: 4\n")), "budget/docker/cpu")
 	if c.Status != Warn {
 		t.Errorf("status = %v, want warn when the cluster claims every core", c.Status)
 	}
@@ -181,7 +185,7 @@ func TestMoreCoresThanTheHostHasFails(t *testing.T) {
 	f := healthy()
 	setCPUs(f, 2)
 
-	c := find(t, Run(context.Background(), f, cfg(t, "cluster:\n  cpus: 8\n")), "host/cpu")
+	c := find(t, Run(context.Background(), f, cfg(t, "cluster:\n  cpus: 8\n")), "budget/docker/cpu")
 	if c.Status != Fail {
 		t.Errorf("status = %v, want fail", c.Status)
 	}
@@ -269,5 +273,62 @@ func TestEveryFailureNamesAFix(t *testing.T) {
 		if strings.TrimSpace(c.Fix) == "" {
 			t.Errorf("check %q failed without telling the user what to do", c.Name)
 		}
+	}
+}
+
+// The bug this check exists for: with the docker driver, minikube runs the node
+// inside Docker's VM, so the ceiling is whatever that VM was given — not the
+// host's RAM. Checking the host reported "8Gi of 36864Mi requested" and passed
+// on a machine where Docker Desktop had 7834Mi and minikube then refused.
+func TestDockerDriverIsBudgetedByDockerNotTheHost(t *testing.T) {
+	f := healthy()
+	setMemoryGi(f, 64) // a big host...
+	f.Responses["docker info --format {{.MemTotal}}"] = runner.Result{
+		Stdout: "8214585344\n", // ...with only 7834Mi given to Docker
+	}
+
+	rep := Run(context.Background(), f, cfg(t, "cluster:\n  memory: 8Gi\n"))
+	c := find(t, rep, "budget/docker/memory")
+
+	if c.Status != Fail {
+		t.Errorf("status = %v, want fail: 8Gi does not fit in Docker's 7834Mi", c.Status)
+	}
+	if !strings.Contains(c.Detail, "Docker Desktop") {
+		t.Errorf("detail does not name the real constraint: %q", c.Detail)
+	}
+	if !strings.Contains(c.Fix, "Docker Desktop") {
+		t.Errorf("fix does not say where to raise it: %q", c.Fix)
+	}
+	if rep.OK() {
+		t.Error("doctor passed a configuration minikube will reject")
+	}
+}
+
+// A VM driver really is bounded by the host, so that path must not regress.
+func TestVMDriverIsBudgetedByTheHost(t *testing.T) {
+	f := healthy()
+	setMemoryGi(f, 64)
+	f.Responses["docker info --format {{.MemTotal}}"] = runner.Result{Stdout: "8214585344\n"}
+
+	rep := Run(context.Background(), f, cfg(t, "cluster:\n  driver: qemu2\n  memory: 16Gi\n"))
+	c := find(t, rep, "budget/qemu2/memory")
+	if c.Status != OK {
+		t.Errorf("status = %v (%s), want ok: 16Gi fits in a 64Gi host", c.Status, c.Detail)
+	}
+}
+
+// Not being able to ask must not block: minikube will still refuse if it does
+// not fit, and a warning is the honest report of "kad could not check".
+func TestUnknownBudgetWarnsRatherThanBlocks(t *testing.T) {
+	f := healthy()
+	f.Errors["docker info --format"] = context.DeadlineExceeded
+
+	rep := Run(context.Background(), f, cfg(t, ""))
+	c := find(t, rep, "budget/docker")
+	if c.Status != Warn {
+		t.Errorf("status = %v, want warn", c.Status)
+	}
+	if rep.OK() == false {
+		t.Error("an unknown budget blocked the build")
 	}
 }

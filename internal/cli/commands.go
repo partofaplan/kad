@@ -26,8 +26,8 @@ name: %s
 cluster:
   driver: docker          # docker | podman | qemu2 | vfkit | hyperkit
   kubernetes: v1.31.0     # pinned on purpose: two runs must agree
-  cpus: 4
-  memory: 8Gi
+  cpus: %d
+  memory: %dMi  # %s
   disk: 40Gi
 
 # Point image and chart pulls at an internal mirror. Leave empty to use the
@@ -52,7 +52,7 @@ apps: []
 #      replicaCount: 1
 `
 
-func runInit(_ context.Context, env *Env, args []string) error {
+func runInit(ctx context.Context, env *Env, args []string) error {
 	fs := newFlagSet("init")
 	path := fileFlag(fs)
 	name := fs.String("name", "", "environment name (default: the current directory)")
@@ -80,7 +80,14 @@ func runInit(_ context.Context, env *Env, args []string) error {
 			ErrUsage, envName, clean)
 	}
 
-	body := fmt.Sprintf(starter, envName)
+	// Size the declaration to the machine it is being written on.
+	//
+	// The defaults used to be fixed at 4 cpu / 8Gi, which does not fit a stock
+	// Docker Desktop — so the very first 'kad up' failed with a minikube error
+	// about memory, on a file kad had just written itself. Asking is cheap and
+	// makes the generated file correct where it is generated.
+	cpus, memMi, note := starterSizing(ctx, env)
+	body := fmt.Sprintf(starter, envName, cpus, memMi, note)
 	// Validate what we are about to write, so 'init' can never produce a file
 	// that 'up' will reject.
 	if _, err := config.Parse([]byte(stripComments(body))); err != nil {
@@ -94,6 +101,40 @@ func runInit(_ context.Context, env *Env, args []string) error {
 	fmt.Fprintf(env.Out, "Next:  kad doctor    # check this machine can build it\n")
 	fmt.Fprintf(env.Out, "       kad up        # build it\n")
 	return nil
+}
+
+// starterSizing picks cluster dimensions that fit where kad is running, and a
+// comment explaining where the number came from.
+func starterSizing(ctx context.Context, env *Env) (cpus, memMi int, note string) {
+	const (
+		fallbackCPUs  = 2
+		fallbackMemMi = 4096
+	)
+
+	b, err := doctor.ResourceBudget(ctx, env.Runner, config.Defaults.Driver)
+	if err != nil {
+		return fallbackCPUs, fallbackMemMi, "conservative default: kad could not measure this machine"
+	}
+
+	// Three quarters, matching what doctor considers healthy, capped at 8Gi
+	// because nothing in the catalog needs more on a laptop.
+	memMi = b.MemMi * 3 / 4
+	if memMi > 8192 {
+		memMi = 8192
+	}
+	if memMi < fallbackMemMi {
+		memMi = fallbackMemMi
+	}
+
+	cpus = b.CPUs - 1
+	if cpus > 4 {
+		cpus = 4
+	}
+	if cpus < fallbackCPUs {
+		cpus = fallbackCPUs
+	}
+
+	return cpus, memMi, fmt.Sprintf("75%% of the %dMi %s has", b.MemMi, b.Source)
 }
 
 func runDoctor(ctx context.Context, env *Env, args []string) error {
