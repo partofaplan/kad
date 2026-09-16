@@ -1,0 +1,273 @@
+package doctor
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/partofaplan/kad/internal/config"
+	"github.com/partofaplan/kad/internal/runner"
+)
+
+func cfg(t *testing.T, extra string) *config.Config {
+	t.Helper()
+	c, err := config.Parse([]byte("apiVersion: kad.aviture.dev/v1alpha1\nkind: Environment\nname: demo\n" + extra))
+	if err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	return c
+}
+
+// setCPUs answers the host-CPU probe for every platform at once, so these
+// tests assert the same thing whichever runner they land on in CI.
+func setCPUs(f *runner.Fake, n int) {
+	f.Responses["sysctl -n hw.ncpu"] = runner.Result{Stdout: fmt.Sprintf("%d\n", n)}
+	f.Responses["nproc"] = runner.Result{Stdout: fmt.Sprintf("%d\n", n)}
+	f.Responses["NumberOfLogicalProcessors"] = runner.Result{Stdout: fmt.Sprintf("%d\n", n)}
+}
+
+// setMemoryGi answers the host-memory probe for every platform at once. Each
+// platform reports a different unit, which is exactly the sort of thing one
+// helper should get right once.
+func setMemoryGi(f *runner.Fake, gi int) {
+	f.Responses["sysctl -n hw.memsize"] = runner.Result{Stdout: fmt.Sprintf("%d\n", gi*1024*1024*1024)}
+	f.Responses["MemTotal"] = runner.Result{Stdout: fmt.Sprintf("%d\n", gi*1024*1024)}
+	f.Responses["TotalPhysicalMemory"] = runner.Result{Stdout: fmt.Sprintf("%d\n", gi*1024*1024*1024)}
+}
+
+// A healthy host, as the fake sees it.
+func healthy() *runner.Fake {
+	f := runner.NewFake()
+	f.Responses["minikube version"] = runner.Result{Stdout: "minikube version: v1.33.1"}
+	f.Responses["kubectl version"] = runner.Result{Stdout: "Client Version: v1.31.0"}
+	f.Responses["helm version"] = runner.Result{Stdout: "v3.16.2+g9a1b2c3"}
+	f.Responses["profile list"] = runner.Result{Stdout: `{"valid":[]}`}
+	setCPUs(f, 10)
+	setMemoryGi(f, 32)
+	return f
+}
+
+func find(t *testing.T, r Report, name string) Check {
+	t.Helper()
+	for _, c := range r.Checks {
+		if c.Name == name {
+			return c
+		}
+	}
+	t.Fatalf("no check named %q in %+v", name, r.Checks)
+	return Check{}
+}
+
+func TestHealthyHostPasses(t *testing.T) {
+	rep := Run(context.Background(), healthy(), cfg(t, ""))
+	if !rep.OK() {
+		t.Errorf("healthy host failed preflight: %+v", rep.Failures())
+	}
+}
+
+func TestMissingBinaryFailsWithAFix(t *testing.T) {
+	f := healthy()
+	f.Missing = []string{"helm"}
+
+	c := find(t, Run(context.Background(), f, cfg(t, "")), "helm")
+	if c.Status != Fail {
+		t.Errorf("missing helm status = %v, want fail", c.Status)
+	}
+	if c.Fix == "" {
+		t.Error("a failing check must tell the user how to fix it")
+	}
+}
+
+func TestOldToolFails(t *testing.T) {
+	f := healthy()
+	f.Responses["minikube version"] = runner.Result{Stdout: "minikube version: v1.20.0"}
+
+	c := find(t, Run(context.Background(), f, cfg(t, "")), "minikube")
+	if c.Status != Fail {
+		t.Errorf("minikube v1.20.0 status = %v, want fail", c.Status)
+	}
+}
+
+// Helm 4 is ahead of what most charts are tested against, but is not
+// known-broken: it must warn without blocking the build.
+func TestHelm4WarnsButDoesNotBlock(t *testing.T) {
+	f := healthy()
+	f.Responses["helm version"] = runner.Result{Stdout: "v4.2.3+g43e8b7f"}
+
+	rep := Run(context.Background(), f, cfg(t, ""))
+	c := find(t, rep, "helm")
+	if c.Status != Warn {
+		t.Errorf("helm 4 status = %v, want warn", c.Status)
+	}
+	if !rep.OK() {
+		t.Error("a warning must not block 'kad up'")
+	}
+}
+
+func TestStoppedRuntimeFails(t *testing.T) {
+	f := healthy()
+	f.Errors["docker info"] = context.DeadlineExceeded
+
+	c := find(t, Run(context.Background(), f, cfg(t, "")), "runtime/docker")
+	if c.Status != Fail {
+		t.Errorf("stopped docker status = %v, want fail", c.Status)
+	}
+	if !strings.Contains(c.Fix, "start") {
+		t.Errorf("fix does not tell the user to start it: %q", c.Fix)
+	}
+}
+
+// The condition on the machine this was written on: four runtimes installed,
+// any of which minikube might pick.
+func TestCompetingRuntimesWarn(t *testing.T) {
+	rep := Run(context.Background(), healthy(), cfg(t, ""))
+	c := find(t, rep, "runtime/ambiguity")
+	if c.Status != Warn {
+		t.Errorf("status = %v, want warn when several runtimes are installed", c.Status)
+	}
+	if !strings.Contains(c.Fix, "docker context") {
+		t.Errorf("fix does not name the remedy: %q", c.Fix)
+	}
+	if !rep.OK() {
+		t.Error("ambiguity is a warning, not a blocker")
+	}
+}
+
+func TestSingleRuntimeDoesNotWarn(t *testing.T) {
+	f := healthy()
+	f.Missing = []string{"podman", "colima", "rancher-desktop", "lima"}
+
+	c := find(t, Run(context.Background(), f, cfg(t, "")), "runtime/ambiguity")
+	if c.Status != OK {
+		t.Errorf("status = %v, want ok with one runtime installed", c.Status)
+	}
+}
+
+func TestOvercommittedMemoryFails(t *testing.T) {
+	f := healthy()
+	setMemoryGi(f, 8)
+
+	c := find(t, Run(context.Background(), f, cfg(t, "cluster:\n  memory: 16Gi\n")), "host/memory")
+	if c.Status != Fail {
+		t.Errorf("status = %v, want fail when asking for more memory than the host has", c.Status)
+	}
+	if !strings.Contains(c.Fix, "kad.yaml") {
+		t.Errorf("fix does not say where to change it: %q", c.Fix)
+	}
+}
+
+func TestMemoryOverThreeQuartersWarns(t *testing.T) {
+	f := healthy()
+	setMemoryGi(f, 16)
+
+	c := find(t, Run(context.Background(), f, cfg(t, "cluster:\n  memory: 14Gi\n")), "host/memory")
+	if c.Status != Warn {
+		t.Errorf("status = %v, want warn at 14 of 16Gi", c.Status)
+	}
+}
+
+func TestClaimingEveryCoreWarns(t *testing.T) {
+	f := healthy()
+	setCPUs(f, 4)
+
+	c := find(t, Run(context.Background(), f, cfg(t, "cluster:\n  cpus: 4\n")), "host/cpu")
+	if c.Status != Warn {
+		t.Errorf("status = %v, want warn when the cluster claims every core", c.Status)
+	}
+}
+
+func TestMoreCoresThanTheHostHasFails(t *testing.T) {
+	f := healthy()
+	setCPUs(f, 2)
+
+	c := find(t, Run(context.Background(), f, cfg(t, "cluster:\n  cpus: 8\n")), "host/cpu")
+	if c.Status != Fail {
+		t.Errorf("status = %v, want fail", c.Status)
+	}
+}
+
+func TestExistingProfileWarns(t *testing.T) {
+	f := healthy()
+	f.Responses["profile list"] = runner.Result{Stdout: `{"valid":[{"Name":"kad-demo"}]}`}
+
+	c := find(t, Run(context.Background(), f, cfg(t, "")), "cluster/profile")
+	if c.Status != Warn {
+		t.Errorf("status = %v, want warn for an existing profile", c.Status)
+	}
+}
+
+// First run has no profiles at all, and minikube exits non-zero for it. That
+// is the normal case and must not be reported as a problem.
+func TestNoProfilesAtAllIsFine(t *testing.T) {
+	f := healthy()
+	f.Errors["profile list"] = context.Canceled
+
+	c := find(t, Run(context.Background(), f, cfg(t, "")), "cluster/profile")
+	if c.Status != OK {
+		t.Errorf("status = %v, want ok on a machine with no minikube profiles", c.Status)
+	}
+}
+
+func TestVMDriverSkipsTheRuntimeCheck(t *testing.T) {
+	f := healthy()
+	f.Missing = []string{"docker", "podman"}
+
+	rep := Run(context.Background(), f, cfg(t, "cluster:\n  driver: qemu2\n"))
+	c := find(t, rep, "runtime/qemu2")
+	if c.Status != OK {
+		t.Errorf("status = %v, want ok: a VM driver needs no container runtime", c.Status)
+	}
+}
+
+func TestParseVersion(t *testing.T) {
+	cases := map[string]version{
+		"minikube version: v1.33.1":                  {1, 33, 1},
+		"v4.2.3+g43e8b7f":                            {4, 2, 3},
+		"Client Version: v1.31.0\nKustomize: v5.4.2": {1, 31, 0},
+		"3.16.2": {3, 16, 2},
+	}
+	for in, want := range cases {
+		got, err := parseVersion(in)
+		if err != nil {
+			t.Errorf("parseVersion(%q): %v", in, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("parseVersion(%q) = %v, want %v", in, got, want)
+		}
+	}
+	if _, err := parseVersion("no version here"); err == nil {
+		t.Error("want an error when there is no version to find")
+	}
+}
+
+func TestVersionOrdering(t *testing.T) {
+	if !(version{1, 2, 3}).less(version{1, 3, 0}) {
+		t.Error("1.2.3 should be less than 1.3.0")
+	}
+	if (version{2, 0, 0}).less(version{1, 99, 99}) {
+		t.Error("2.0.0 should not be less than 1.99.99")
+	}
+	if (version{1, 2, 3}).less(version{1, 2, 3}) {
+		t.Error("a version is not less than itself")
+	}
+}
+
+// Every failing check must carry a remedy; a report that only says "no" has
+// moved the confusion rather than removed it.
+func TestEveryFailureNamesAFix(t *testing.T) {
+	f := healthy()
+	f.Missing = []string{"minikube", "kubectl", "helm", "docker"}
+	setCPUs(f, 1)
+
+	rep := Run(context.Background(), f, cfg(t, ""))
+	if len(rep.Failures()) == 0 {
+		t.Fatal("expected failures on a host missing everything")
+	}
+	for _, c := range rep.Failures() {
+		if strings.TrimSpace(c.Fix) == "" {
+			t.Errorf("check %q failed without telling the user what to do", c.Name)
+		}
+	}
+}
