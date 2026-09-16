@@ -22,29 +22,92 @@ release](https://github.com/partofaplan/kad/releases/latest), check it against
 
 **macOS and Linux**
 
-```bash
-OS=$(uname -s | tr '[:upper:]' '[:lower:]')          # darwin | linux
-ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
-VERSION=$(curl -fsSL https://api.github.com/repos/partofaplan/kad/releases/latest | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')
+Copy the lines inside the box below, not the fence markers around it.
 
-curl -fsSLO "https://github.com/partofaplan/kad/releases/download/${VERSION}/kad_${VERSION}_${OS}_${ARCH}.tar.gz"
-tar -xzf "kad_${VERSION}_${OS}_${ARCH}.tar.gz"
-sudo install "kad_${OS}_${ARCH}/kad" /usr/local/bin/kad
+<!-- Maintainers: no `#` comments inside these blocks, ever. macOS zsh does not
+     set interactive_comments, so a pasted `VAR=value  # note` line runs `#` as
+     a command and the assignment is scoped to it — the variable comes out
+     EMPTY, and the reader gets a 404 on a URL with a hole in it. Explain
+     things in the prose instead.
+
+     In that prose, keep backticks BALANCED and never write a literal triple.
+     People bulk-paste whole sections, and an odd number opens a backquote that
+     swallows every line after it, leaving them at a bquote> prompt with
+     nothing downloaded. A balanced pair is survivable — zsh just reports the
+     contents as a command it cannot find. -->
+
+```bash
+VERSION=v2.0.0
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+BASE="https://github.com/partofaplan/kad/releases/download/${VERSION}"
+ARCHIVE="kad_${VERSION}_${OS}_${ARCH}.tar.gz"
+
+curl -fsSLO "${BASE}/${ARCHIVE}"
+curl -fsSLO "${BASE}/checksums.txt"
 ```
 
-On macOS, Gatekeeper quarantines downloaded binaries. If it refuses to run:
-`xattr -d com.apple.quarantine /usr/local/bin/kad`.
+Then verify it and install it. That is deliberately one long line rather than
+five readable ones. Chaining with `&&` means the install cannot run unless the
+checksum matched, so a file that is not what was published never reaches your
+PATH — and keeping it on one line means a half-finished paste cannot skip the
+check either, which a multi-line version would allow.
+
+```bash
+{ shasum -a 256 -c checksums.txt --ignore-missing || sha256sum -c checksums.txt --ignore-missing; } && tar -xzf "${ARCHIVE}" && sudo install "kad_${OS}_${ARCH}/kad" /usr/local/bin/kad && kad version
+```
+
+macOS has shasum and most Linux distributions have sha256sum, so seeing one of
+them report "command not found" is normal — what matters is that a line ends in
+OK. If you see FAILED, nothing was installed, and you should not run the
+archive you downloaded. Note that a FAILED run prints a "command not found" too,
+so that message alone tells you nothing either way.
+
+That last line should print the version. If it does, you are done.
+
+`VERSION` is the release to install — check the [releases
+page](https://github.com/partofaplan/kad/releases) for anything newer. `OS` and
+`ARCH` detect themselves, resolving to darwin or linux, and amd64 or arm64.
+
+The version is written out rather than looked up through the GitHub API on
+purpose. The API allows 60 unauthenticated requests per hour per IP, and over
+that limit the lookup returns nothing — which produced a curl 404 against a URL
+with an empty version in it, then a tar error about a file that was never
+downloaded. Neither message mentions the actual cause.
+
+**If macOS refuses to run the binary**, clear the quarantine flag:
+
+```bash
+xattr -d com.apple.quarantine /usr/local/bin/kad
+```
+
+You will usually not need this. macOS quarantines files downloaded by a
+*browser*, not by curl, so if you followed the steps above the attribute is not
+there and the command reports "No such xattr" — which is harmless, and means
+Gatekeeper was never your problem.
 
 **Windows** (PowerShell)
 
 ```powershell
-$version = (Invoke-RestMethod https://api.github.com/repos/partofaplan/kad/releases/latest).tag_name
-$arch    = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'amd64' }
+$version = 'v2.0.0'   # check the releases page above for anything newer
+$arch    = if ($env:PROCESSOR_ARCHITEW6432 -eq 'ARM64' -or $env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'amd64' }
 
 Invoke-WebRequest "https://github.com/partofaplan/kad/releases/download/$version/kad_${version}_windows_$arch.zip" -OutFile kad.zip
+Invoke-WebRequest "https://github.com/partofaplan/kad/releases/download/$version/checksums.txt" -OutFile checksums.txt
+
+$published = ((Select-String "kad_${version}_windows_$arch.zip" checksums.txt).Line -split '\s+')[0]
+$actual    = (Get-FileHash kad.zip -Algorithm SHA256).Hash.ToLower()
+if ($actual -ne $published) { throw "checksum mismatch: $actual is not $published" }
+
 Expand-Archive kad.zip -DestinationPath $env:LOCALAPPDATA\kad -Force
 $env:PATH += ";$env:LOCALAPPDATA\kad\kad_windows_$arch"
+kad version
 ```
+
+That `throw` stops the block before anything is unpacked if the download does
+not match what was published. The `$env:PATH` line lasts for the current
+session only. To keep it, add the
+same directory through **System Properties → Environment Variables**.
 
 **From source**, on any platform with Go 1.25 or later:
 
