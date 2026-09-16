@@ -25,7 +25,7 @@ release](https://github.com/partofaplan/kad/releases/latest), check it against
 Copy the lines **inside** the box, not the ``` fences around it.
 
 ```bash
-VERSION=v1.0.0   # check the releases page above for anything newer
+VERSION=v2.0.0   # check the releases page above for anything newer
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')          # darwin | linux
 ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
 
@@ -57,7 +57,7 @@ Gatekeeper was never your problem.
 **Windows** (PowerShell)
 
 ```powershell
-$version = 'v1.0.0'   # check the releases page above for anything newer
+$version = 'v2.0.0'   # check the releases page above for anything newer
 $arch    = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'amd64' }
 
 Invoke-WebRequest "https://github.com/partofaplan/kad/releases/download/$version/kad_${version}_windows_$arch.zip" -OutFile kad.zip
