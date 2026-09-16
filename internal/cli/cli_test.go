@@ -3,11 +3,13 @@ package cli
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/partofaplan/kad/internal/config"
 	"github.com/partofaplan/kad/internal/runner"
 )
 
@@ -298,6 +300,56 @@ func TestStatusSaysSoWhenItCannotReachTheCluster(t *testing.T) {
 		}
 		if !strings.Contains(c2.out.String(), "Could not reach the cluster") {
 			t.Errorf("status hid an unreachable cluster:\n%s", c2.out)
+		}
+	})
+}
+
+// 'kad init' must never write a file that 'kad up' then refuses — that is the
+// same broken promise as a preflight check passing a config minikube rejects.
+// Swept across pool sizes because the floor, the 75% ratio and the 8Gi cap each
+// take over in a different range.
+func TestInitNeverWritesAConfigItsOwnParserRejects(t *testing.T) {
+	for _, poolGi := range []int{1, 2, 4, 5, 6, 8, 12, 16, 32, 64} {
+		for _, cpus := range []int{1, 2, 4, 12, 32} {
+			name := fmt.Sprintf("%dGi/%dcpu", poolGi, cpus)
+			t.Run(name, func(t *testing.T) {
+				inDir(t, func(dir string) {
+					c := newCapture()
+					c.fake.Responses["docker info --format"] = runner.Result{
+						Stdout: fmt.Sprintf("%d %d\n", int64(poolGi)*1024*1024*1024, cpus),
+					}
+					if code := Run(c.env, []string{"init", "-name", "sized"}); code != 0 {
+						t.Fatalf("init exit = %d: %s", code, c.err)
+					}
+
+					body, err := os.ReadFile(filepath.Join(dir, "kad.yaml"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, err := config.Parse(body); err != nil {
+						t.Fatalf("init wrote a config its own parser rejects:\n%v\n\n%s", err, body)
+					}
+				})
+			})
+		}
+	}
+}
+
+// The note explains where the number came from, so it must not talk a user out
+// of a machine that works. A 5000Mi pool clamps to kad's 4096Mi minimum, but
+// 5000Mi is perfectly usable and must not be called "not enough".
+func TestInitDoesNotCallAUsableMachineTooSmall(t *testing.T) {
+	inDir(t, func(dir string) {
+		c := newCapture()
+		c.fake.Responses["docker info --format"] = runner.Result{
+			Stdout: fmt.Sprintf("%d 4\n", 5000*1024*1024), // 5000Mi: over kad's minimum
+		}
+		if code := Run(c.env, []string{"init", "-name", "sized"}); code != 0 {
+			t.Fatalf("init exit = %d: %s", code, c.err)
+		}
+		body, _ := os.ReadFile(filepath.Join(dir, "kad.yaml"))
+		if strings.Contains(string(body), "not enough") {
+			t.Errorf("a 5000Mi pool was described as insufficient:\n%s", body)
 		}
 	})
 }
