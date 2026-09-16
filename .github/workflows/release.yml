@@ -1,0 +1,143 @@
+name: Release
+
+# Manual only, and only from main.
+#
+# Under the RELEASE.MAJOR.MINOR scheme, merging into develop moves MINOR and
+# merging into main moves MAJOR — both automatic, both in ci.yml. Cutting a
+# release moves RELEASE, and that is a decision rather than a side effect of a
+# merge. So this is the one workflow a human starts.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build and show the release notes without tagging or publishing'
+        required: true
+        default: true
+        type: boolean
+
+# One release at a time, never cancelled: a half-published release is worse
+# than a queued one.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Cut a release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Refuse to release from anywhere but main
+        run: |
+          if [ "${{ github.ref_name }}" != "main" ]; then
+            echo "::error::releases are cut from main only; got ${{ github.ref_name }}"
+            exit 1
+          fi
+
+      # `gh workflow run -f dry_run=false` sends the STRING "false" over the
+      # REST API; `type: boolean` only produces a real boolean when dispatched
+      # from the web UI. In GitHub expressions ANY non-empty string is truthy,
+      # so `!inputs.dry_run` is false for "false" — every publish step would
+      # skip and a real release would quietly do nothing while reporting
+      # success.
+      #
+      # Normalised once here, and everything gates on this output. It fails
+      # SAFE: only an explicit false publishes, so an empty, misspelled or
+      # unexpected value is treated as a dry run rather than shipping.
+      - name: Decide whether to publish
+        id: mode
+        # Through env, not interpolated into the script: this job holds
+        # contents: write, and dispatch is the one way in that does not pass
+        # review, so it gets the careful form.
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          case "$DRY_RUN" in
+            false|False|FALSE) publish=true ;;
+            *)                 publish=false ;;
+          esac
+          echo "publish=${publish}" >> "$GITHUB_OUTPUT"
+          echo "dry_run input = '${DRY_RUN}' -> publish=${publish}"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0   # tags are the source of truth; we need all of them
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      # A release publishes binaries people run. It does not get a lighter
+      # check than a pull request does.
+      - name: Verify
+        run: |
+          go vet ./...
+          go test ./...
+          ./hack/next-version_test.sh
+
+      - name: Compute the release version
+        id: v
+        run: |
+          next=$(./hack/next-version.sh release)
+          echo "version=${next}" >> "$GITHUB_OUTPUT"
+          echo "release version: v${next}"
+
+      # Notes span from the previous release to now. With no previous release,
+      # the range starts at the oldest tag — both answers come from the same
+      # script, so tag-reading stays in one place.
+      - name: Assemble release notes
+        id: notes
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          from=$(./hack/next-version.sh last-release)
+          [ -z "$from" ] && from=$(./hack/next-version.sh first-tag)
+
+          {
+            echo "## kad v${VERSION}"
+            echo
+            echo "Download the archive for your platform below, unpack it, and put"
+            echo "\`kad\` on your PATH. Verify it against \`checksums.txt\` first."
+            echo
+            echo "### Changes"
+            echo
+            if [ -n "$from" ]; then
+              git log --no-merges --pretty='- %s' "${from}..HEAD"
+            else
+              git log --no-merges --pretty='- %s'
+            fi
+          } > notes.md
+          cat notes.md
+
+      - name: Build the archives
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: make dist VERSION="v${VERSION}"
+
+      - name: Dry run — stop here
+        if: steps.mode.outputs.publish != 'true'
+        run: |
+          echo "Dry run. Nothing was tagged or published."
+          echo "Would publish v${{ steps.v.outputs.version }} with:"
+          ls -1 dist/
+
+      - name: Tag and publish
+        if: steps.mode.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "v${VERSION}" -m "Release v${VERSION}"
+          git push origin "v${VERSION}"
+
+          gh release create "v${VERSION}" \
+            --title "kad v${VERSION}" \
+            --notes-file notes.md \
+            --verify-tag \
+            dist/*

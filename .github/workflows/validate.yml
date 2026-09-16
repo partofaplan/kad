@@ -1,0 +1,110 @@
+name: Validate
+
+# Gate 5: the real thing, after the merge.
+#
+# Nothing before a merge is allowed to touch a real cluster, so this is the only
+# place the core path is exercised end to end: declare, preflight, build, tear
+# down. It runs on a GitHub-hosted runner with its own throwaway minikube — it
+# is not shared with anyone, and nothing here is kept.
+#
+# This gate CANNOT block a merge. It runs after one. It catches what escaped; it
+# does not prevent escape.
+on:
+  push:
+    branches: [ develop ]
+  workflow_dispatch:
+
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  core-path:
+    name: Build and tear down a real cluster
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install the tools kad orchestrates
+        uses: medyagh/setup-minikube@e9e035a86bbc3caea26a450bd4dbf9d0c453682e # v0.0.21
+        with:
+          start: false
+
+      - run: make build
+
+      # Sized for a GitHub-hosted runner: 4 cores, 16GB. Asking for all 4 would
+      # trip kad's own "claims every core" warning, which is correct behaviour
+      # and would make this job's output confusing.
+      - name: Declare an environment
+        run: |
+          cat > kad.yaml <<'YAML'
+          apiVersion: kad.aviture.dev/v1alpha1
+          kind: Environment
+          name: ci
+          cluster:
+            driver: docker
+            kubernetes: v1.31.0
+            cpus: 2
+            memory: 6Gi
+            disk: 20Gi
+          tools:
+            - ingress
+            - metrics
+          YAML
+          ./bin/kad up -dry-run
+
+      - name: Preflight
+        run: ./bin/kad doctor
+
+      - name: Build it
+        run: ./bin/kad up
+
+      - name: It is actually running
+        run: |
+          kubectl --context kad-ci get nodes
+          kubectl --context kad-ci wait --for=condition=Ready nodes --all --timeout=120s
+          ./bin/kad status
+          minikube profile list -o json | grep -q '"Name":"kad-ci"' \
+            || { echo "::error::profile kad-ci was not created"; exit 1; }
+
+      - name: Tear it down
+        run: ./bin/kad down -y
+
+      # The Core Principle, as an assertion. If any of these fail, kad created
+      # something that 'kad down' cannot reclaim, and the change that did it is
+      # wrong whatever else it improved.
+      - name: Nothing was left behind
+        run: |
+          if minikube profile list -o json 2>/dev/null | grep -q '"Name":"kad-ci"'; then
+            echo "::error::profile kad-ci survived 'kad down'"
+            exit 1
+          fi
+          echo "  ok  profile removed"
+
+          # 'helm repo add' writes here and outlives the profile. kad resolves
+          # charts with --repo precisely so this stays empty.
+          if [ -s "${HOME}/.config/helm/repositories.yaml" ] \
+             && grep -q 'kad-' "${HOME}/.config/helm/repositories.yaml"; then
+            echo "::error::kad left entries in the user's helm repository list"
+            cat "${HOME}/.config/helm/repositories.yaml"
+            exit 1
+          fi
+          echo "  ok  no global helm state"
+
+          # kad starts minikube with --keep-context, so the user's current
+          # kubectl context must be untouched.
+          if kubectl config current-context 2>/dev/null | grep -q '^kad-'; then
+            echo "::error::kad left the kubectl current-context pointing at its own cluster"
+            exit 1
+          fi
+          echo "  ok  kubectl context not hijacked"
+
+      - name: Teardown is idempotent
+        run: ./bin/kad down -y
