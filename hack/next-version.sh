@@ -7,7 +7,6 @@
 #
 # Also:
 #   last-release   prints the newest release tag (vR.0.0), or nothing if none
-#   first-tag      prints the oldest tag, for release notes with no prior release
 #
 # Tags are the source of truth, so there is no VERSION file to drift. This lives
 # in one script rather than inline in each workflow: ci.yml and release.yml both
@@ -22,8 +21,8 @@ set -euo pipefail
 
 kind=${1:-}
 case "$kind" in
-  minor|major|release|last-release|first-tag) ;;
-  *) echo "usage: $0 <minor|major|release|last-release|first-tag>" >&2; exit 2 ;;
+  minor|major|release|last-release) ;;
+  *) echo "usage: $0 <minor|major|release|last-release>" >&2; exit 2 ;;
 esac
 
 # Three ways "no tags" can be a lie rather than a fact, each of which would
@@ -50,13 +49,6 @@ tags=$(git tag --list 'v*')
 last_release=$(printf '%s\n' "$tags" | grep -E '^v[0-9]+\.0\.0$' | sort -V | tail -n1 || true)
 if [ "$kind" = "last-release" ]; then
   printf '%s\n' "$last_release"
-  exit 0
-fi
-
-# The oldest tag, used as the notes range for the FIRST release, when there is
-# no previous release to measure from.
-if [ "$kind" = "first-tag" ]; then
-  printf '%s\n' "$(printf '%s\n' "$tags" | sort -V | head -n1 || true)"
   exit 0
 fi
 
