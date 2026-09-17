@@ -225,3 +225,56 @@ func walk(t *testing.T, prefix string, m map[string]any, fn func(path string, v 
 		fn(path, v)
 	}
 }
+
+// Notes are copy-paste instructions, and 'kad up' passes --keep-context=true
+// on purpose — so the user's current kubectl context is deliberately NOT the
+// kad cluster. A kubectl command in a Note without a context therefore runs
+// against whatever else is active. Two entries shipped exactly that.
+//
+// This is the assertion that stops it coming back: the Note field is a static
+// string with no access to the profile name, so nothing else would catch it.
+func TestNotesWithKubectlCommandsCarryAContext(t *testing.T) {
+	for _, tool := range All() {
+		if tool.Access == nil || !strings.Contains(tool.Access.Note, "kubectl ") {
+			continue
+		}
+		if !strings.Contains(tool.Access.Note, "--context "+ContextPlaceholder) {
+			t.Errorf("%s: note runs kubectl against the user's current context, not the kad cluster.\n"+
+				"  add '--context %s' to it:\n  %s", tool.Name, ContextPlaceholder, tool.Access.Note)
+		}
+	}
+}
+
+// The same trap with a different tool: 'minikube tunnel' needs -p, and the
+// ingress note used to carry a literal "<profile>" nobody substituted.
+func TestNotesHaveNoUnsubstitutedPlaceholders(t *testing.T) {
+	for _, tool := range All() {
+		if tool.Access == nil {
+			continue
+		}
+		for _, bad := range []string{"<profile>", "<context>", "<name>", "{{.Profile}}"} {
+			if strings.Contains(tool.Access.Note, bad) {
+				t.Errorf("%s: note contains %q, which nothing substitutes; use %s:\n  %s",
+					tool.Name, bad, ContextPlaceholder, tool.Access.Note)
+			}
+		}
+	}
+}
+
+func TestRenderNoteSubstitutesTheContext(t *testing.T) {
+	nexus, _ := Get("nexus")
+	got := RenderNote(nexus.Access.Note, "kad-demo")
+
+	if strings.Contains(got, ContextPlaceholder) {
+		t.Errorf("placeholder survived rendering: %s", got)
+	}
+	if !strings.Contains(got, "--context kad-demo") {
+		t.Errorf("rendered note does not target the kad cluster: %s", got)
+	}
+	// minio's note contains a jsonpath expression in single braces. Rendering
+	// must not touch it.
+	minio, _ := Get("minio")
+	if out := RenderNote(minio.Access.Note, "kad-demo"); !strings.Contains(out, "{.data.rootUser}") {
+		t.Errorf("rendering mangled the jsonpath expression: %s", out)
+	}
+}

@@ -304,7 +304,7 @@ func runStatus(ctx context.Context, env *Env, args []string) error {
 				}
 			}
 			if t.Access.Note != "" {
-				fmt.Fprintf(env.Out, "      note: %s\n", t.Access.Note)
+				fmt.Fprintf(env.Out, "      note: %s\n", catalog.RenderNote(t.Access.Note, cfg.Profile()))
 			}
 			fmt.Fprintln(env.Out)
 		}

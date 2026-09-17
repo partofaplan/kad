@@ -23,6 +23,23 @@ const (
 	WaveApp      = 30 // backing services for the code under development
 )
 
+// ContextPlaceholder is substituted with the environment's kubectl context
+// wherever it appears in a Note.
+//
+// Notes are static strings and the catalog has no access to the profile name,
+// which is how two entries came to carry copy-paste kubectl commands with no
+// --context. 'kad up' passes --keep-context=true on purpose, so the user's
+// current context is deliberately NOT the kad cluster and those commands ran
+// against whatever else was active. Service and SecretRef never had the
+// problem because runStatus formats them with the profile; Note now goes
+// through the same door.
+const ContextPlaceholder = "{{.Context}}"
+
+// RenderNote substitutes the environment's context into a Note.
+func RenderNote(note, profile string) string {
+	return strings.ReplaceAll(note, ContextPlaceholder, profile)
+}
+
 // Access describes how a human reaches a tool once it is running.
 type Access struct {
 	Service   string // service name to port-forward
@@ -72,7 +89,7 @@ var builtin = map[string]Tool{
 		Description: "NGINX ingress controller (minikube addon)",
 		Addon:       "ingress",
 		Wave:        WaveInfra,
-		Access:      &Access{Note: "Run 'minikube tunnel -p <profile>' to reach Ingress hosts from the host machine."},
+		Access:      &Access{Note: "Run 'minikube tunnel -p " + ContextPlaceholder + "' to reach Ingress hosts from the host machine."},
 	},
 	"metrics": {
 		Name:        "metrics",
@@ -135,8 +152,8 @@ var builtin = map[string]Tool{
 		},
 		Access: &Access{
 			Service: "nexus-nexus-repository-manager", Port: 8081, User: "admin",
-			Note: "First-run password: kubectl exec -n nexus deploy/nexus-nexus-repository-manager " +
-				"-- cat /nexus-data/admin.password",
+			Note: "First-run password: kubectl --context " + ContextPlaceholder +
+				" exec -n nexus deploy/nexus-nexus-repository-manager -- cat /nexus-data/admin.password",
 		},
 	},
 	"jenkins": {
@@ -221,7 +238,8 @@ var builtin = map[string]Tool{
 		Access: &Access{
 			Service: "minio-console", Port: 9001,
 			SecretRef: "minio/minio/rootPassword",
-			Note:      "Username: kubectl get secret -n minio minio -o jsonpath='{.data.rootUser}' | base64 -d",
+			Note: "Username: kubectl --context " + ContextPlaceholder +
+				" get secret -n minio minio -o jsonpath='{.data.rootUser}' | base64 -d",
 		},
 	},
 	"postgres": {
