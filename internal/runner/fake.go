@@ -34,13 +34,22 @@ func (f *Fake) Run(_ context.Context, name string, args ...string) (Result, erro
 	line := f.line(name, args)
 	f.Calls = append(f.Calls, line)
 
-	if k, ok := bestMatch(line, keysOfErrors(f.Errors)); ok {
-		return Result{Code: 1}, f.Errors[k]
-	}
+	// Errors and Responses COMPOSE rather than shadowing one another. A
+	// command that exits non-zero still produces output, and the real runner
+	// hands back both — so a fake that drops the output on error cannot
+	// describe the case that matters most: a tool failing while saying why.
+	// It silently turned one such test into a vacuous pass.
+	var res Result
 	if k, ok := bestMatch(line, keysOfResults(f.Responses)); ok {
-		return f.Responses[k], nil
+		res = f.Responses[k]
 	}
-	return Result{}, nil
+	if k, ok := bestMatch(line, keysOfErrors(f.Errors)); ok {
+		if res.Code == 0 {
+			res.Code = 1
+		}
+		return res, f.Errors[k]
+	}
+	return res, nil
 }
 
 // bestMatch returns the LONGEST key that is a substring of line.

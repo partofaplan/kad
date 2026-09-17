@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/partofaplan/kad/internal/cluster"
 	"github.com/partofaplan/kad/internal/config"
 	"github.com/partofaplan/kad/internal/runner"
 )
@@ -278,7 +279,17 @@ func memoryCheck(name string, cfg *config.Config, b Budget) Check {
 		c.Status = Warn
 		c.Detail = fmt.Sprintf("cluster.memory (%s) is over 75%% of the %dMi %s has",
 			cfg.Cluster.Memory, b.MemMi, b.Source)
-		c.Fix = fmt.Sprintf("consider %dMi to leave room for everything else", suggest)
+		// In a narrow band — a pool between kad's minimum and 5461Mi — three
+		// quarters lands under the floor, so the suggestion clamps back to the
+		// value already configured. Naming it is an instruction with nothing
+		// the user can do to clear it. There is no smaller number; say so, and
+		// name the thing that would actually help.
+		if suggest >= wantMi {
+			c.Fix = fmt.Sprintf("this is already kad's %dMi floor, so there is nothing to lower — headroom has to come from giving %s more memory",
+				config.MinMemoryMi, b.Source)
+		} else {
+			c.Fix = fmt.Sprintf("consider %dMi to leave room for everything else", suggest)
+		}
 	default:
 		c.Status = OK
 		c.Detail = fmt.Sprintf("%s of %dMi available to %s", cfg.Cluster.Memory, b.MemMi, b.Source)
@@ -291,16 +302,20 @@ func memoryCheck(name string, cfg *config.Config, b Budget) Check {
 func checkProfileCollision(ctx context.Context, r runner.Runner, cfg *config.Config) Check {
 	c := Check{Name: "cluster/profile"}
 
-	res, err := r.Run(ctx, "minikube", "profile", "list", "-o", "json")
-	if err != nil || strings.TrimSpace(res.Stdout) == "" {
-		// No profiles at all is the normal first-run case, and minikube exits
-		// non-zero for it. Nothing to collide with.
-		c.Status = OK
-		c.Detail = "no existing profile named " + cfg.Profile()
+	// Shared with 'kad down' rather than scanned for here: one decoder, so
+	// doctor's answer and teardown's answer cannot disagree about what exists.
+	exists, err := cluster.Exists(ctx, r, cfg)
+	if err != nil {
+		// Whatever stopped kad asking is already reported by the minikube
+		// check above, so this warns instead of failing twice for one cause.
+		// It does not claim the profile is absent, which is the thing that
+		// would send someone into 'kad up' expecting a clean build.
+		c.Status = Warn
+		c.Detail = "could not check whether " + cfg.Profile() + " already exists"
+		c.Fix = "make sure 'minikube profile list' works; until it does, 'kad up' may be adopting a profile kad did not build"
 		return c
 	}
-	if strings.Contains(res.Stdout, `"Name":"`+cfg.Profile()+`"`) ||
-		strings.Contains(res.Stdout, `"Name": "`+cfg.Profile()+`"`) {
+	if exists {
 		c.Status = Warn
 		c.Detail = "profile " + cfg.Profile() + " already exists"
 		c.Fix = "'kad up' will reuse it; 'kad down' deletes it first if you want a clean build"

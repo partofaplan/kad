@@ -66,7 +66,8 @@ echo "release tags, for the notes range"
 check v1.0.0 v1.2.3 v2.0.0 v2.1.0 -- last-release v2.0.0
 check v1.2.3 v1.3.0      -- last-release ""
 check ""                 -- last-release ""
-check v0.0.1 v0.1.0 v1.0.0 -- first-tag v0.0.1
+# There is deliberately no lower bound for a first release: the caller logs
+# the whole history instead. Asking for one is now a usage error.
 
 echo
 echo "refusing to guess"

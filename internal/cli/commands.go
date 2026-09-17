@@ -251,7 +251,11 @@ func runStatus(ctx context.Context, env *Env, args []string) error {
 	}
 
 	fmt.Fprintf(env.Out, "Environment %q  (profile %s)\n\n", cfg.Name, cfg.Profile())
-	if !cluster.Exists(ctx, env.Runner, cfg) {
+	exists, err := cluster.Exists(ctx, env.Runner, cfg)
+	if err != nil {
+		return err
+	}
+	if !exists {
 		fmt.Fprintf(env.Out, "  Not built. Run 'kad up'.\n")
 		return nil
 	}
@@ -304,7 +308,7 @@ func runStatus(ctx context.Context, env *Env, args []string) error {
 				}
 			}
 			if t.Access.Note != "" {
-				fmt.Fprintf(env.Out, "      note: %s\n", t.Access.Note)
+				fmt.Fprintf(env.Out, "      note: %s\n", catalog.RenderNote(t.Access.Note, cfg.Profile()))
 			}
 			fmt.Fprintln(env.Out)
 		}
@@ -326,7 +330,14 @@ func runDown(ctx context.Context, env *Env, args []string) error {
 	if err != nil {
 		return err
 	}
-	if !cluster.Exists(ctx, env.Runner, cfg) {
+	// Not "does it exist" but "can kad tell": reporting a successful teardown
+	// because minikube could not be reached is the one outcome worse than
+	// failing, because the user stops looking.
+	exists, err := cluster.Exists(ctx, env.Runner, cfg)
+	if err != nil {
+		return fmt.Errorf("%w\nprofile %s may still exist; nothing was removed", err, cfg.Profile())
+	}
+	if !exists {
 		fmt.Fprintf(env.Out, "Nothing to remove: profile %s does not exist.\n", cfg.Profile())
 		return nil
 	}
@@ -334,9 +345,11 @@ func runDown(ctx context.Context, env *Env, args []string) error {
 	if !*yes {
 		fmt.Fprintf(env.Out, "This deletes profile %s and everything in it, permanently.\n", cfg.Profile())
 		fmt.Fprintf(env.Out, "Type the environment name (%s) to confirm: ", cfg.Name)
-		var answer string
-		fmt.Scanln(&answer)
-		if strings.TrimSpace(answer) != cfg.Name {
+		answer, err := confirm(env.In)
+		if err != nil {
+			return fmt.Errorf("could not read the confirmation; nothing was removed: %w", err)
+		}
+		if answer != cfg.Name {
 			return fmt.Errorf("not confirmed; nothing was removed")
 		}
 	}

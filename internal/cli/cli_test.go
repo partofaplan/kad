@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/partofaplan/kad/internal/catalog"
 	"github.com/partofaplan/kad/internal/config"
 	"github.com/partofaplan/kad/internal/runner"
 )
@@ -22,7 +23,13 @@ type capture struct {
 
 func newCapture() *capture {
 	c := &capture{out: &bytes.Buffer{}, err: &bytes.Buffer{}, fake: runner.NewFake()}
-	c.env = &Env{Runner: c.fake, Out: c.out, Err: c.err}
+	c.env = &Env{Runner: c.fake, In: strings.NewReader(""), Out: c.out, Err: c.err}
+	return c
+}
+
+// answers wires typed input to the command's stdin.
+func (c *capture) answers(s string) *capture {
+	c.env.In = strings.NewReader(s)
 	return c
 }
 
@@ -350,6 +357,137 @@ func TestInitDoesNotCallAUsableMachineTooSmall(t *testing.T) {
 		body, _ := os.ReadFile(filepath.Join(dir, "kad.yaml"))
 		if strings.Contains(string(body), "not enough") {
 			t.Errorf("a 5000Mi pool was described as insufficient:\n%s", body)
+		}
+	})
+}
+
+// --- the confirmation guard on the one irreversible thing kad does ---
+
+// The happy path: the name typed matches, so the cluster goes.
+func TestDownDeletesWhenTheNameIsTyped(t *testing.T) {
+	inDir(t, func(dir string) {
+		Run(newCapture().env, []string{"init", "-name", "demo"})
+
+		c := newCapture().answers("demo\n")
+		c.fake.Responses["profile list"] = runner.Result{Stdout: `{"valid":[{"Name":"kad-demo"}]}`}
+		if code := Run(c.env, []string{"down"}); code != 0 {
+			t.Fatalf("exit = %d: %s", code, c.err)
+		}
+		if !c.fake.Called("minikube delete --profile=kad-demo") {
+			t.Errorf("a confirmed teardown did not run: %v", c.fake.Calls)
+		}
+	})
+}
+
+// Everything that is not the environment name must abort, and must abort
+// BEFORE minikube is asked to delete anything.
+func TestDownAbortsWithoutTheRightAnswer(t *testing.T) {
+	cases := map[string]string{
+		"a different name": "prod\n",
+		"an empty line":    "\n",
+		"whitespace":       "   \n",
+		"the profile name": "kad-demo\n",
+		"yes":              "y\n",
+		"eof":              "",
+	}
+	for name, answer := range cases {
+		t.Run(name, func(t *testing.T) {
+			inDir(t, func(dir string) {
+				Run(newCapture().env, []string{"init", "-name", "demo"})
+
+				c := newCapture().answers(answer)
+				c.fake.Responses["profile list"] = runner.Result{Stdout: `{"valid":[{"Name":"kad-demo"}]}`}
+				if code := Run(c.env, []string{"down"}); code == 0 {
+					t.Errorf("exit = 0 for answer %q; the teardown was not confirmed", answer)
+				}
+				if c.fake.Called("minikube delete") {
+					t.Errorf("answer %q deleted the cluster anyway: %v", answer, c.fake.Calls)
+				}
+			})
+		})
+	}
+}
+
+// A prompt nobody can answer is not consent.
+func TestDownAbortsWhenTheAnswerCannotBeRead(t *testing.T) {
+	inDir(t, func(dir string) {
+		Run(newCapture().env, []string{"init", "-name", "demo"})
+
+		c := newCapture()
+		c.env.In = errReader{}
+		c.fake.Responses["profile list"] = runner.Result{Stdout: `{"valid":[{"Name":"kad-demo"}]}`}
+		if code := Run(c.env, []string{"down"}); code == 0 {
+			t.Error("exit = 0 although the confirmation could not be read")
+		}
+		if c.fake.Called("minikube delete") {
+			t.Errorf("deleted the cluster without a readable answer: %v", c.fake.Calls)
+		}
+	})
+}
+
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) { return 0, errors.New("stdin is gone") }
+
+// The bug: any minikube failure read as "absent", so 'kad down' reported a
+// successful teardown it had not performed. Exit 0 here means the user stops
+// looking for a cluster that is still running.
+func TestDownFailsWhenItCannotTellWhetherTheClusterExists(t *testing.T) {
+	inDir(t, func(dir string) {
+		Run(newCapture().env, []string{"init", "-name", "demo"})
+
+		c := newCapture()
+		c.fake.Errors["profile list"] = errors.New(`minikube: executable file not found in $PATH`)
+		if code := Run(c.env, []string{"down", "-y"}); code == 0 {
+			t.Fatal("down exited 0 without establishing whether the cluster was there")
+		}
+		if !strings.Contains(c.err.String(), "may still exist") {
+			t.Errorf("the failure does not warn the cluster may survive: %q", c.err)
+		}
+		if c.fake.Called("minikube delete") {
+			t.Errorf("tried to delete regardless: %v", c.fake.Calls)
+		}
+	})
+}
+
+// Every kubectl command 'kad status' prints has to target the cluster kad
+// built. 'kad up' passes --keep-context=true on purpose, so the user's
+// current context is deliberately not this one.
+func TestStatusPrintsNoContextlessKubectl(t *testing.T) {
+	inDir(t, func(dir string) {
+		Run(newCapture().env, []string{"init", "-name", "demo"})
+		if err := os.WriteFile("kad.yaml", []byte(`apiVersion: kad.aviture.dev/v1alpha1
+kind: Environment
+name: demo
+cluster:
+  driver: docker
+  kubernetes: v1.31.0
+  cpus: 2
+  memory: 4Gi
+  disk: 40Gi
+tools: [ingress, nexus, minio]
+`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		c := newCapture()
+		c.fake.Responses["profile list"] = runner.Result{Stdout: `{"valid":[{"Name":"kad-demo"}]}`}
+		if code := Run(c.env, []string{"status"}); code != 0 {
+			t.Fatalf("exit = %d: %s", code, c.err)
+		}
+
+		out := c.out.String()
+		if strings.Contains(out, catalog.ContextPlaceholder) {
+			t.Errorf("status printed an unsubstituted placeholder:\n%s", out)
+		}
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, "kubectl ") && !strings.Contains(line, "--context kad-demo") {
+				t.Errorf("kubectl command with no context, so it runs against the wrong cluster:\n  %s", line)
+			}
+		}
+		// The note is the line that regressed; prove it was rendered at all.
+		if !strings.Contains(out, "kubectl --context kad-demo exec -n nexus") {
+			t.Errorf("nexus note missing or unrendered:\n%s", out)
 		}
 	})
 }

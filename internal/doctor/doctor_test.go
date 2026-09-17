@@ -2,6 +2,7 @@ package doctor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -206,9 +207,18 @@ func TestExistingProfileWarns(t *testing.T) {
 
 // First run has no profiles at all, and minikube exits non-zero for it. That
 // is the normal case and must not be reported as a problem.
+//
+// The error has to be a *runner.ExitError, which is what the real runner
+// returns for a command that ran and exited non-zero. It used to stand in as
+// context.Canceled, which was harmless while every error meant the same
+// thing — but "minikube said no" and "minikube never ran" are now different
+// answers, and only the first of them is this test's subject.
 func TestNoProfilesAtAllIsFine(t *testing.T) {
 	f := healthy()
-	f.Errors["profile list"] = context.Canceled
+	f.Errors["profile list"] = &runner.ExitError{
+		Cmd:    "minikube profile list -o json",
+		Result: runner.Result{Code: 1, Stderr: "no minikube profile was found"},
+	}
 
 	c := find(t, Run(context.Background(), f, cfg(t, "")), "cluster/profile")
 	if c.Status != OK {
@@ -371,5 +381,68 @@ func TestTooSmallAPoolSaysSoInsteadOfSuggestingAnImpossibleValue(t *testing.T) {
 	}
 	if strings.Contains(c.Fix, "1536") {
 		t.Errorf("fix suggested a value below kad's minimum: %q", c.Fix)
+	}
+}
+
+// In a narrow band — a pool between kad's 4096Mi minimum and 5461Mi — three
+// quarters of the pool lands under the floor, so the suggestion clamps back to
+// the value already configured. The warning was then telling the user to
+// "consider 4096Mi" on a cluster already set to 4096Mi: an instruction with no
+// action that clears it.
+func TestWarningNeverSuggestsTheValueAlreadyConfigured(t *testing.T) {
+	// Every pool where the clamp can engage, plus the boundaries either side.
+	for poolMi := config.MinMemoryMi; poolMi <= 5600; poolMi += 37 {
+		f := healthy()
+		setDockerBudget(f, 10, int64(poolMi)*1024*1024)
+
+		want := fmt.Sprintf("cluster:\n  memory: %dMi\n", config.MinMemoryMi)
+		c := find(t, Run(context.Background(), f, cfg(t, want)), "budget/docker/memory")
+		if c.Status != Warn {
+			continue // not the warn band for this pool; other tests cover it
+		}
+		if strings.Contains(c.Fix, fmt.Sprintf("consider %dMi", config.MinMemoryMi)) {
+			t.Fatalf("pool %dMi: fix suggests the configured value, which changes nothing: %q", poolMi, c.Fix)
+		}
+		if !strings.Contains(c.Fix, "floor") {
+			t.Fatalf("pool %dMi: fix does not say the cluster is already at kad's minimum: %q", poolMi, c.Fix)
+		}
+	}
+}
+
+// The ordinary case still names a smaller number, because there is one.
+func TestWarningStillSuggestsALowerValueWhenOneExists(t *testing.T) {
+	f := healthy()
+	setBudget(f, 10, 16)
+
+	c := find(t, Run(context.Background(), f, cfg(t, "cluster:\n  memory: 14Gi\n")), "budget/docker/memory")
+	if c.Status != Warn {
+		t.Fatalf("status = %v, want warn at 14 of 16Gi", c.Status)
+	}
+	if !strings.Contains(c.Fix, "consider 12288Mi") {
+		t.Errorf("fix does not name the value that would clear the warning: %q", c.Fix)
+	}
+}
+
+// Being unable to ask minikube is not the same as there being no profile. Said
+// as "no existing profile", it sends someone into 'kad up' expecting a clean
+// build on a machine that may already have one.
+func TestUncheckableProfileWarnsRatherThanClaimingAbsence(t *testing.T) {
+	f := healthy()
+	// healthy() answers 'profile list' with a real empty document. Remove it:
+	// this test is about minikube never running, and a fake that both prints
+	// a good list and fails to run describes a machine that cannot exist.
+	delete(f.Responses, "profile list")
+	f.Errors["profile list"] = errors.New(`minikube: executable file not found in $PATH`)
+
+	rep := Run(context.Background(), f, cfg(t, ""))
+	c := find(t, rep, "cluster/profile")
+	if c.Status != Warn {
+		t.Errorf("status = %v, want warn when kad could not check", c.Status)
+	}
+	if strings.Contains(c.Detail, "no existing profile") {
+		t.Errorf("claimed the profile is absent without checking: %q", c.Detail)
+	}
+	if !rep.OK() {
+		t.Error("an uncheckable profile blocked the build; the minikube check already reports the cause")
 	}
 }

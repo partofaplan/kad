@@ -2,12 +2,14 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/partofaplan/kad/internal/config"
 	"github.com/partofaplan/kad/internal/runner"
@@ -30,6 +32,7 @@ type command struct {
 // Env is everything a command needs from the outside world.
 type Env struct {
 	Runner runner.Runner
+	In     io.Reader
 	Out    io.Writer
 	Err    io.Writer
 }
@@ -46,7 +49,7 @@ var commands = []command{
 
 // Main is the entry point. It returns a process exit code.
 func Main(args []string) int {
-	return Run(&Env{Runner: &runner.Exec{}, Out: os.Stdout, Err: os.Stderr}, args)
+	return Run(&Env{Runner: &runner.Exec{}, In: os.Stdin, Out: os.Stdout, Err: os.Stderr}, args)
 }
 
 // Run dispatches one command against an explicit environment, so the command
@@ -122,6 +125,26 @@ func parse(fs *flag.FlagSet, args []string) error {
 		return fmt.Errorf("%w: %v", ErrUsage, err)
 	}
 	return nil
+}
+
+// confirm reads one typed line of confirmation.
+//
+// It reads from Env rather than os.Stdin because this guard stands in front of
+// the only irreversible thing kad does, and a prompt wired straight to the
+// process's stdin cannot be exercised by a test at all.
+//
+// Every failure to read is an abort. An unanswerable prompt is not consent.
+func confirm(in io.Reader) (string, error) {
+	if in == nil {
+		return "", errors.New("no input stream to read the answer from")
+	}
+	line, err := bufio.NewReader(in).ReadString('\n')
+	// A final line with no trailing newline comes back as (data, io.EOF), and
+	// that is a real answer. EOF with nothing before it is not.
+	if err != nil && (line == "" || !errors.Is(err, io.EOF)) {
+		return "", err
+	}
+	return strings.TrimSpace(line), nil
 }
 
 func runVersion(_ context.Context, env *Env, _ []string) error {

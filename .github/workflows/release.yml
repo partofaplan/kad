@@ -86,16 +86,20 @@ jobs:
           echo "version=${next}" >> "$GITHUB_OUTPUT"
           echo "release version: v${next}"
 
-      # Notes span from the previous release to now. With no previous release,
-      # the range starts at the oldest tag — both answers come from the same
-      # script, so tag-reading stays in one place.
+      # Notes span from the previous release to now.
+      #
+      # With NO previous release the notes are the whole history, not a range.
+      # This used to fall back to the oldest tag as a lower bound, but
+      # `git log <tag>..HEAD` EXCLUDES that tag and everything before it — so
+      # the very first release would have shipped notes with the entire initial
+      # implementation missing. There is no lower bound to give for a first
+      # release; the absence of one is the answer.
       - name: Assemble release notes
         id: notes
         env:
           VERSION: ${{ steps.v.outputs.version }}
         run: |
           from=$(./hack/next-version.sh last-release)
-          [ -z "$from" ] && from=$(./hack/next-version.sh first-tag)
 
           {
             echo "## kad v${VERSION}"
@@ -108,7 +112,7 @@ jobs:
             if [ -n "$from" ]; then
               git log --no-merges --pretty='- %s' "${from}..HEAD"
             else
-              git log --no-merges --pretty='- %s'
+              git log --no-merges --pretty='- %s' HEAD
             fi
           } > notes.md
           cat notes.md
