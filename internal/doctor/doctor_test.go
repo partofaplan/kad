@@ -428,6 +428,10 @@ func TestWarningStillSuggestsALowerValueWhenOneExists(t *testing.T) {
 // build on a machine that may already have one.
 func TestUncheckableProfileWarnsRatherThanClaimingAbsence(t *testing.T) {
 	f := healthy()
+	// healthy() answers 'profile list' with a real empty document. Remove it:
+	// this test is about minikube never running, and a fake that both prints
+	// a good list and fails to run describes a machine that cannot exist.
+	delete(f.Responses, "profile list")
 	f.Errors["profile list"] = errors.New(`minikube: executable file not found in $PATH`)
 
 	rep := Run(context.Background(), f, cfg(t, ""))

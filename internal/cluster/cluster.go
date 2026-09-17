@@ -90,34 +90,75 @@ func ProfileExists(ctx context.Context, r runner.Runner, profile string) (bool, 
 // for `"Name":"x"` double-counts and cannot tell the two apart. Invalid
 // profiles are included on purpose: a corrupt profile still owns a cluster,
 // and 'kad down' has to be able to remove it.
+//
+// The fields are pointers so their ABSENCE is detectable. Without that, any
+// JSON object at all decodes to an empty list and reads as "no profiles" —
+// which is precisely the failure this type exists to prevent.
 type profileList struct {
-	Valid   []profileEntry `json:"valid"`
-	Invalid []profileEntry `json:"invalid"`
+	Valid   *[]profileEntry   `json:"valid"`
+	Invalid *[]profileEntry   `json:"invalid"`
+	Error   *profileListError `json:"error"`
 }
 
 type profileEntry struct {
 	Name string `json:"Name"`
 }
 
+// profileListError is what minikube prints INSTEAD of a list when it cannot
+// enumerate profiles. Observed against minikube v1.33.1 with no
+// ~/.minikube/profiles directory:
+//
+//	$ minikube profile list -o json
+//	{"error":{"Op":"open","Path":"/home/u/.minikube/profiles","Err":2}}
+//	$ echo $?
+//	80
+//
+// Err is the syscall errno.
+type profileListError struct {
+	Op   string `json:"Op"`
+	Path string `json:"Path"`
+	Err  int    `json:"Err"`
+}
+
+// errnoENOENT is "no such file or directory". On the profiles directory it
+// means minikube has never created a profile, which is a real "none" rather
+// than a failure to ask. Every other errno is a failure to ask.
+const errnoENOENT = 2
+
 // parseProfileNames reports the profile names in minikube's output, and
-// whether the output was a profile list at all.
+// whether the output was an answer at all.
 func parseProfileNames(stdout string) ([]string, bool) {
 	out := strings.TrimSpace(stdout)
 	// minikube prints advisory lines above the JSON in some states, so the
 	// document starts at the first brace rather than at byte zero.
-	if i := strings.IndexByte(out, '{'); i >= 0 {
-		out = out[i:]
-	} else {
+	i := strings.IndexByte(out, '{')
+	if i < 0 {
 		return nil, false
 	}
 
 	var list profileList
-	if err := json.Unmarshal([]byte(out), &list); err != nil {
+	if err := json.Unmarshal([]byte(out[i:]), &list); err != nil {
 		return nil, false
 	}
-	names := make([]string, 0, len(list.Valid)+len(list.Invalid))
-	for _, group := range [][]profileEntry{list.Valid, list.Invalid} {
-		for _, p := range group {
+
+	if list.Error != nil {
+		if list.Error.Err == errnoENOENT {
+			return nil, true
+		}
+		return nil, false
+	}
+	// Neither a list nor an error: some other document, and no evidence of
+	// anything. Saying "absent" here is a guess.
+	if list.Valid == nil && list.Invalid == nil {
+		return nil, false
+	}
+
+	var names []string
+	for _, group := range []*[]profileEntry{list.Valid, list.Invalid} {
+		if group == nil {
+			continue
+		}
+		for _, p := range *group {
 			if p.Name != "" {
 				names = append(names, p.Name)
 			}
