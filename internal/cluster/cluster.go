@@ -3,6 +3,8 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -39,13 +41,99 @@ func StartArgs(cfg *config.Config) []string {
 }
 
 // Exists reports whether this environment's profile is already present.
-func Exists(ctx context.Context, r runner.Runner, cfg *config.Config) bool {
+func Exists(ctx context.Context, r runner.Runner, cfg *config.Config) (bool, error) {
+	return ProfileExists(ctx, r, cfg.Profile())
+}
+
+// ProfileExists answers the same question for any profile name.
+//
+// The error return is the whole point. Mapping every minikube failure to
+// "absent" let 'kad down' print "nothing to remove" and exit 0 on a machine
+// where the profile was still there and minikube was simply unreachable —
+// reporting success for work it had not done. A teardown that cannot verify
+// its own result must not claim one.
+func ProfileExists(ctx context.Context, r runner.Runner, profile string) (bool, error) {
 	res, err := r.Run(ctx, "minikube", "profile", "list", "-o", "json")
-	if err != nil {
-		return false
+
+	// minikube answering is what settles it, not the exit code: it exits
+	// non-zero in states where it still prints a perfectly good document.
+	if names, ok := parseProfileNames(res.Stdout); ok {
+		for _, n := range names {
+			if n == profile {
+				return true, nil
+			}
+		}
+		return false, nil
 	}
-	return strings.Contains(res.Stdout, `"Name":"`+cfg.Profile()+`"`) ||
-		strings.Contains(res.Stdout, `"Name": "`+cfg.Profile()+`"`)
+
+	if err == nil {
+		return false, fmt.Errorf("could not read minikube's profile list: %q", trim(res.Stdout))
+	}
+	// A command that never ran is not an answer. This is the case the bug was
+	// filed for: minikube uninstalled while a kad- profile survives.
+	var exit *runner.ExitError
+	if !errors.As(err, &exit) {
+		return false, fmt.Errorf("could not ask minikube which profiles exist: %w", err)
+	}
+	// minikube ran and printed no profile document at all. That is how it
+	// reports having no profiles, which is a real "absent".
+	if strings.TrimSpace(res.Stdout) == "" {
+		return false, nil
+	}
+	return false, fmt.Errorf("minikube could not list profiles: %w", err)
+}
+
+// profileList is the part of 'minikube profile list -o json' kad reads.
+//
+// Decoded rather than string-scanned: the document spells "Name" twice per
+// profile — once on the profile and once on its nested Config — so a search
+// for `"Name":"x"` double-counts and cannot tell the two apart. Invalid
+// profiles are included on purpose: a corrupt profile still owns a cluster,
+// and 'kad down' has to be able to remove it.
+type profileList struct {
+	Valid   []profileEntry `json:"valid"`
+	Invalid []profileEntry `json:"invalid"`
+}
+
+type profileEntry struct {
+	Name string `json:"Name"`
+}
+
+// parseProfileNames reports the profile names in minikube's output, and
+// whether the output was a profile list at all.
+func parseProfileNames(stdout string) ([]string, bool) {
+	out := strings.TrimSpace(stdout)
+	// minikube prints advisory lines above the JSON in some states, so the
+	// document starts at the first brace rather than at byte zero.
+	if i := strings.IndexByte(out, '{'); i >= 0 {
+		out = out[i:]
+	} else {
+		return nil, false
+	}
+
+	var list profileList
+	if err := json.Unmarshal([]byte(out), &list); err != nil {
+		return nil, false
+	}
+	names := make([]string, 0, len(list.Valid)+len(list.Invalid))
+	for _, group := range [][]profileEntry{list.Valid, list.Invalid} {
+		for _, p := range group {
+			if p.Name != "" {
+				names = append(names, p.Name)
+			}
+		}
+	}
+	return names, true
+}
+
+// trim shortens output for an error message, so a runaway response does not
+// become the whole error.
+func trim(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) > 120 {
+		return s[:120] + "..."
+	}
+	return s
 }
 
 // Start creates or resumes the profile.

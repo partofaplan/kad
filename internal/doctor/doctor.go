@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/partofaplan/kad/internal/cluster"
 	"github.com/partofaplan/kad/internal/config"
 	"github.com/partofaplan/kad/internal/runner"
 )
@@ -291,16 +292,20 @@ func memoryCheck(name string, cfg *config.Config, b Budget) Check {
 func checkProfileCollision(ctx context.Context, r runner.Runner, cfg *config.Config) Check {
 	c := Check{Name: "cluster/profile"}
 
-	res, err := r.Run(ctx, "minikube", "profile", "list", "-o", "json")
-	if err != nil || strings.TrimSpace(res.Stdout) == "" {
-		// No profiles at all is the normal first-run case, and minikube exits
-		// non-zero for it. Nothing to collide with.
-		c.Status = OK
-		c.Detail = "no existing profile named " + cfg.Profile()
+	// Shared with 'kad down' rather than scanned for here: one decoder, so
+	// doctor's answer and teardown's answer cannot disagree about what exists.
+	exists, err := cluster.Exists(ctx, r, cfg)
+	if err != nil {
+		// Whatever stopped kad asking is already reported by the minikube
+		// check above, so this warns instead of failing twice for one cause.
+		// It does not claim the profile is absent, which is the thing that
+		// would send someone into 'kad up' expecting a clean build.
+		c.Status = Warn
+		c.Detail = "could not check whether " + cfg.Profile() + " already exists"
+		c.Fix = "make sure 'minikube profile list' works; until it does, 'kad up' may be adopting a profile kad did not build"
 		return c
 	}
-	if strings.Contains(res.Stdout, `"Name":"`+cfg.Profile()+`"`) ||
-		strings.Contains(res.Stdout, `"Name": "`+cfg.Profile()+`"`) {
+	if exists {
 		c.Status = Warn
 		c.Detail = "profile " + cfg.Profile() + " already exists"
 		c.Fix = "'kad up' will reuse it; 'kad down' deletes it first if you want a clean build"

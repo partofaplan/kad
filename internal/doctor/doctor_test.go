@@ -2,6 +2,7 @@ package doctor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -206,9 +207,18 @@ func TestExistingProfileWarns(t *testing.T) {
 
 // First run has no profiles at all, and minikube exits non-zero for it. That
 // is the normal case and must not be reported as a problem.
+//
+// The error has to be a *runner.ExitError, which is what the real runner
+// returns for a command that ran and exited non-zero. It used to stand in as
+// context.Canceled, which was harmless while every error meant the same
+// thing — but "minikube said no" and "minikube never ran" are now different
+// answers, and only the first of them is this test's subject.
 func TestNoProfilesAtAllIsFine(t *testing.T) {
 	f := healthy()
-	f.Errors["profile list"] = context.Canceled
+	f.Errors["profile list"] = &runner.ExitError{
+		Cmd:    "minikube profile list -o json",
+		Result: runner.Result{Code: 1, Stderr: "no minikube profile was found"},
+	}
 
 	c := find(t, Run(context.Background(), f, cfg(t, "")), "cluster/profile")
 	if c.Status != OK {
@@ -371,5 +381,25 @@ func TestTooSmallAPoolSaysSoInsteadOfSuggestingAnImpossibleValue(t *testing.T) {
 	}
 	if strings.Contains(c.Fix, "1536") {
 		t.Errorf("fix suggested a value below kad's minimum: %q", c.Fix)
+	}
+}
+
+// Being unable to ask minikube is not the same as there being no profile. Said
+// as "no existing profile", it sends someone into 'kad up' expecting a clean
+// build on a machine that may already have one.
+func TestUncheckableProfileWarnsRatherThanClaimingAbsence(t *testing.T) {
+	f := healthy()
+	f.Errors["profile list"] = errors.New(`minikube: executable file not found in $PATH`)
+
+	rep := Run(context.Background(), f, cfg(t, ""))
+	c := find(t, rep, "cluster/profile")
+	if c.Status != Warn {
+		t.Errorf("status = %v, want warn when kad could not check", c.Status)
+	}
+	if strings.Contains(c.Detail, "no existing profile") {
+		t.Errorf("claimed the profile is absent without checking: %q", c.Detail)
+	}
+	if !rep.OK() {
+		t.Error("an uncheckable profile blocked the build; the minikube check already reports the cause")
 	}
 }

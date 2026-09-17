@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -91,14 +92,114 @@ func TestExists(t *testing.T) {
 	r.Responses["profile list"] = runner.Result{
 		Stdout: `{"valid":[{"Name":"kad-demo","Status":"Running"}]}`,
 	}
-	if !Exists(context.Background(), r, testConfig(t)) {
+	got, err := Exists(context.Background(), r, testConfig(t))
+	if err != nil {
+		t.Fatalf("Exists: %v", err)
+	}
+	if !got {
 		t.Error("Exists = false for a profile that is present")
 	}
 
 	r2 := runner.NewFake()
 	r2.Responses["profile list"] = runner.Result{Stdout: `{"valid":[{"Name":"other"}]}`}
-	if Exists(context.Background(), r2, testConfig(t)) {
+	got, err = Exists(context.Background(), r2, testConfig(t))
+	if err != nil {
+		t.Fatalf("Exists: %v", err)
+	}
+	if got {
 		t.Error("Exists = true for a profile that is absent")
+	}
+}
+
+// Real 'minikube profile list -o json' spells "Name" twice per profile: once
+// on the profile, once on its nested Config. A string scan cannot tell a
+// profile named X from a profile whose config happens to mention X, which is
+// why this decodes. The fixture below is the real shape, trimmed.
+func TestExistsDecodesTheRealProfileDocument(t *testing.T) {
+	const out = `{"invalid":[],"valid":[{"Name":"kad-demo","Status":"Running","Config":{"Name":"kad-demo","Driver":"docker","Memory":8192},"Active":false}]}`
+
+	r := runner.NewFake()
+	r.Responses["profile list"] = runner.Result{Stdout: out}
+	got, err := Exists(context.Background(), r, testConfig(t))
+	if err != nil {
+		t.Fatalf("Exists: %v", err)
+	}
+	if !got {
+		t.Error("Exists = false for a profile the real minikube output contains")
+	}
+}
+
+// A corrupt profile still owns a cluster, so teardown has to be able to find
+// it. minikube reports those under "invalid" rather than "valid".
+func TestExistsFindsInvalidProfiles(t *testing.T) {
+	r := runner.NewFake()
+	r.Responses["profile list"] = runner.Result{
+		Stdout: `{"invalid":[{"Name":"kad-demo","Status":"Unknown"}],"valid":[]}`,
+	}
+	got, err := Exists(context.Background(), r, testConfig(t))
+	if err != nil {
+		t.Fatalf("Exists: %v", err)
+	}
+	if !got {
+		t.Error("Exists = false for a profile minikube listed as invalid")
+	}
+}
+
+// minikube exits non-zero with nothing on stdout when it has no profiles at
+// all. That is an answer — "absent" — and must not become an error, or the
+// normal first run would fail.
+func TestExistsTreatsAnEmptyProfileListAsAbsent(t *testing.T) {
+	r := runner.NewFake()
+	r.Errors["profile list"] = &runner.ExitError{
+		Cmd:    "minikube profile list -o json",
+		Result: runner.Result{Code: 1, Stderr: "no minikube profile was found"},
+	}
+	got, err := Exists(context.Background(), r, testConfig(t))
+	if err != nil {
+		t.Fatalf("Exists errored on an empty profile list: %v", err)
+	}
+	if got {
+		t.Error("Exists = true with no profiles")
+	}
+}
+
+// The bug this pair of returns exists for: kad could not ask minikube, and
+// reported "absent". 'kad down' then printed nothing-to-remove and exited 0
+// with the cluster still on the machine.
+func TestExistsReportsAnErrorWhenItCannotAskMinikube(t *testing.T) {
+	r := runner.NewFake()
+	r.Errors["profile list"] = errors.New(`minikube: exec: "minikube": executable file not found in $PATH`)
+
+	got, err := Exists(context.Background(), r, testConfig(t))
+	if err == nil {
+		t.Fatal("Exists reported an answer it could not obtain; a teardown would claim success")
+	}
+	if got {
+		t.Error("Exists = true alongside an error")
+	}
+}
+
+// Output that is not a profile list is not evidence of anything either.
+func TestExistsReportsAnErrorForUnreadableOutput(t *testing.T) {
+	r := runner.NewFake()
+	r.Responses["profile list"] = runner.Result{Stdout: "Error: something went sideways\n"}
+	if _, err := Exists(context.Background(), r, testConfig(t)); err == nil {
+		t.Error("Exists accepted output that was not a profile list")
+	}
+}
+
+// minikube prints advisory lines above the JSON in some states.
+func TestExistsSkipsAPreambleAboveTheJSON(t *testing.T) {
+	r := runner.NewFake()
+	r.Responses["profile list"] = runner.Result{
+		Stdout: "! docker is taking longer than usual\n{\"valid\":[{\"Name\":\"kad-demo\"}]}\n",
+	}
+	got, err := Exists(context.Background(), r, testConfig(t))
+	if err != nil {
+		t.Fatalf("Exists: %v", err)
+	}
+	if !got {
+		t.Error("Exists = false because minikube printed a warning above its JSON")
 	}
 }
 
