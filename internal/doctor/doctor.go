@@ -279,7 +279,17 @@ func memoryCheck(name string, cfg *config.Config, b Budget) Check {
 		c.Status = Warn
 		c.Detail = fmt.Sprintf("cluster.memory (%s) is over 75%% of the %dMi %s has",
 			cfg.Cluster.Memory, b.MemMi, b.Source)
-		c.Fix = fmt.Sprintf("consider %dMi to leave room for everything else", suggest)
+		// In a narrow band — a pool between kad's minimum and 5461Mi — three
+		// quarters lands under the floor, so the suggestion clamps back to the
+		// value already configured. Naming it is an instruction with nothing
+		// the user can do to clear it. There is no smaller number; say so, and
+		// name the thing that would actually help.
+		if suggest >= wantMi {
+			c.Fix = fmt.Sprintf("this is already kad's %dMi floor, so there is nothing to lower — headroom has to come from giving %s more memory",
+				config.MinMemoryMi, b.Source)
+		} else {
+			c.Fix = fmt.Sprintf("consider %dMi to leave room for everything else", suggest)
+		}
 	default:
 		c.Status = OK
 		c.Detail = fmt.Sprintf("%s of %dMi available to %s", cfg.Cluster.Memory, b.MemMi, b.Source)

@@ -384,6 +384,45 @@ func TestTooSmallAPoolSaysSoInsteadOfSuggestingAnImpossibleValue(t *testing.T) {
 	}
 }
 
+// In a narrow band — a pool between kad's 4096Mi minimum and 5461Mi — three
+// quarters of the pool lands under the floor, so the suggestion clamps back to
+// the value already configured. The warning was then telling the user to
+// "consider 4096Mi" on a cluster already set to 4096Mi: an instruction with no
+// action that clears it.
+func TestWarningNeverSuggestsTheValueAlreadyConfigured(t *testing.T) {
+	// Every pool where the clamp can engage, plus the boundaries either side.
+	for poolMi := config.MinMemoryMi; poolMi <= 5600; poolMi += 37 {
+		f := healthy()
+		setDockerBudget(f, 10, int64(poolMi)*1024*1024)
+
+		want := fmt.Sprintf("cluster:\n  memory: %dMi\n", config.MinMemoryMi)
+		c := find(t, Run(context.Background(), f, cfg(t, want)), "budget/docker/memory")
+		if c.Status != Warn {
+			continue // not the warn band for this pool; other tests cover it
+		}
+		if strings.Contains(c.Fix, fmt.Sprintf("consider %dMi", config.MinMemoryMi)) {
+			t.Fatalf("pool %dMi: fix suggests the configured value, which changes nothing: %q", poolMi, c.Fix)
+		}
+		if !strings.Contains(c.Fix, "floor") {
+			t.Fatalf("pool %dMi: fix does not say the cluster is already at kad's minimum: %q", poolMi, c.Fix)
+		}
+	}
+}
+
+// The ordinary case still names a smaller number, because there is one.
+func TestWarningStillSuggestsALowerValueWhenOneExists(t *testing.T) {
+	f := healthy()
+	setBudget(f, 10, 16)
+
+	c := find(t, Run(context.Background(), f, cfg(t, "cluster:\n  memory: 14Gi\n")), "budget/docker/memory")
+	if c.Status != Warn {
+		t.Fatalf("status = %v, want warn at 14 of 16Gi", c.Status)
+	}
+	if !strings.Contains(c.Fix, "consider 12288Mi") {
+		t.Errorf("fix does not name the value that would clear the warning: %q", c.Fix)
+	}
+}
+
 // Being unable to ask minikube is not the same as there being no profile. Said
 // as "no existing profile", it sends someone into 'kad up' expecting a clean
 // build on a machine that may already have one.
